@@ -82,24 +82,17 @@ pre_check() {
 }
 
 #=============================================================================
-# 安装依赖（逐个检查，缺啥装啥，不折腾源）
+# 安装依赖（缺啥直接从 deb.debian.org 下 .deb，不碰 apt 源）
 #=============================================================================
 install_deps() {
     step "安装基础依赖"
 
     local pkgs_missing=""
 
-    # 检查每个必要的命令，只装缺的
     for cmd in curl wget unzip socat python3; do
-        if ! command -v "$cmd" &>/dev/null; then
-            pkgs_missing="$pkgs_missing $cmd"
-        fi
+        command -v "$cmd" &>/dev/null || pkgs_missing="$pkgs_missing $cmd"
     done
-
-    # ca-certificates 处理（不是命令，是包）
-    if [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
-        pkgs_missing="$pkgs_missing ca-certificates"
-    fi
+    [[ ! -f /etc/ssl/certs/ca-certificates.crt ]] && pkgs_missing="$pkgs_missing ca-certificates"
 
     if [[ -z "$pkgs_missing" ]]; then
         info "所有依赖已就绪，跳过安装"
@@ -107,65 +100,49 @@ install_deps() {
     fi
 
     info "缺少:${pkgs_missing}"
-    echo -e "${CYAN}直接安装...${NC}"
 
-    if [[ "$PKG_MGR" == "apt-get" ]]; then
-        # 移走镜像配置文件，避免 mirror+file 卡死
-        mkdir -p /tmp/apt-mirror-backup
-        mv /etc/apt/mirrors/* /tmp/apt-mirror-backup/ 2>/dev/null || true
-        mv /etc/apt/sources.list.d/*mirror* /tmp/apt-mirror-backup/ 2>/dev/null || true
+    local arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+    local base="http://deb.debian.org/debian"
 
-        # 不跑 update，直接装，加 30s 超时防止卡死
-        timeout 30 apt-get install -y --no-install-recommends $pkgs_missing 2>&1 | while IFS= read -r line; do
-            if [[ "$line" =~ (Setting\ up|Unpacking|Installing|Selecting|Get:) ]]; then
-                echo -e "  ${GREEN}▸${NC} $line"
-            fi
-        done
-    else
-        $PKG_INSTALL $pkgs_missing 2>&1 | while IFS= read -r line; do
-            if [[ "$line" =~ (Installing|Downloading) ]]; then
-                echo -e "  ${GREEN}▸${NC} $line"
-            fi
-        done
-    fi
-
-    # 二次确认：apt 失败则直接从 deb.debian.org 下载 .deb 安装
-    local still_missing=""
-    for cmd in curl wget unzip socat python3; do
-        command -v "$cmd" &>/dev/null || still_missing="$still_missing $cmd"
-    done
-    if [[ -n "$still_missing" ]]; then
-        warn "apt 安装失败，直接从 deb.debian.org 下载 .deb..."
-        local arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
-        local codename=$(grep VERSION_CODENAME /etc/os-release 2>/dev/null | cut -d= -f2)
-        [[ -z "$codename" ]] && codename="bookworm"
-        local deb_base="http://deb.debian.org/debian/pool/main"
-
-        for pkg in $still_missing; do
-            # 映射包名到 .deb URL（常见依赖）
+    for pkg in $pkgs_missing; do
+        # 查 .deb 路径（先试 apt-cache，再试直接安装查 url）
+        local url=""
+        url=$(apt-cache show "$pkg" 2>/dev/null | grep "^Filename:" | head -1 | awk "{print \"$base/\"\$2}")
+        if [[ -z "$url" ]]; then
+            # apt-cache 也要连源，换方案：直接 apt-get --print-uris
+            url=$(apt-get install --print-uris -y "$pkg" 2>/dev/null | grep "^'" | head -1 | cut -d"'" -f2)
+        fi
+        if [[ -z "$url" ]]; then
+            # 最后兜底：猜常见包路径
             case $pkg in
-                curl)    deb_url="$deb_base/c/curl/curl_*_${arch}.deb" ;;
-                wget)    deb_url="$deb_base/w/wget/wget_*_${arch}.deb" ;;
-                unzip)   deb_url="$deb_base/u/unzip/unzip_*_${arch}.deb" ;;
-                socat)   deb_url="$deb_base/s/socat/socat_*_${arch}.deb" ;;
-                python3) deb_url="$deb_base/p/python3-defaults/python3_*_${arch}.deb" ;;
-                *)       continue ;;
+                unzip) url="$base/pool/main/u/unzip/unzip_*_${arch}.deb" ;;
+                curl)  url="$base/pool/main/c/curl/curl_*_${arch}.deb" ;;
+                wget)  url="$base/pool/main/w/wget/wget_*_${arch}.deb" ;;
+                socat) url="$base/pool/main/s/socat/socat_*_${arch}.deb" ;;
+                python3) url="$base/pool/main/p/python3-defaults/python3_*_${arch}.deb" ;;
             esac
-            # 用 apt-cache 查确切版本号
-            local real_url=$(apt-cache show "$pkg" 2>/dev/null | grep "^Filename:" | head -1 | awk '{print "http://deb.debian.org/debian/"$2}')
-            if [[ -z "$real_url" ]]; then
-                real_url=$(apt-get install --print-uris -y "$pkg" 2>/dev/null | grep "^'" | head -1 | cut -d"'" -f2)
-            fi
-            if [[ -n "$real_url" ]]; then
-                echo -e "  ${CYAN}下载 $pkg...${NC}"
-                curl -#L --connect-timeout 10 "$real_url" -o "/tmp/${pkg}.deb" 2>/dev/null && {
-                    dpkg -i "/tmp/${pkg}.deb" 2>/dev/null && echo -e "  ${GREEN}▸${NC} $pkg 安装成功" || true
-                    rm -f "/tmp/${pkg}.deb"
-                }
-            fi
-        done
-        # 修复可能的中断依赖
-        apt-get install -f -y --no-install-recommends 2>/dev/null || true
+        fi
+
+        echo -e "  ${CYAN}下载 $pkg...${NC}"
+        if curl -fsSL --connect-timeout 10 --retry 2 "$url" -o "/tmp/${pkg}.deb" 2>/dev/null; then
+            dpkg -i "/tmp/${pkg}.deb" 2>/dev/null && echo -e "  ${GREEN}▸${NC} $pkg 安装成功" || true
+            rm -f "/tmp/${pkg}.deb"
+        else
+            warn "$pkg 下载失败，尝试 apt 兜底..."
+            timeout 30 apt-get install -y --no-install-recommends "$pkg" 2>/dev/null || true
+        fi
+    done
+
+    # 修复依赖
+    timeout 30 apt-get install -f -y --no-install-recommends 2>/dev/null || true
+
+    # 最后确认
+    local still=""
+    for cmd in curl wget unzip socat python3; do
+        command -v "$cmd" &>/dev/null || still="$still $cmd"
+    done
+    if [[ -n "$still" ]]; then
+        error "无法安装:${still}，请手动安装后重试"
     fi
 
     info "依赖安装完成"
@@ -346,7 +323,7 @@ PRIVATE_KEY=$PRIVATE_KEY
 SHORT_ID=$SHORT_ID
 SHORT_ID2=$SHORT_ID2
 DEST=$DEST
-INSTALL_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+INSTALL_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 METAEOF
 
     SERVER_IP=$(get_ip)
@@ -458,7 +435,7 @@ UUID=$UUID
 ENC_MODE=$ENC_MODE
 TICKET=$ticket_time
 DECRYPTION=$DECRYPTION
-INSTALL_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+INSTALL_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 METAEOF
 
     SERVER_IP=$(get_ip)
@@ -535,7 +512,7 @@ JSONEOF
 TYPE=$PROTO_TYPE
 PORT=$PORT
 UUID=$UUID
-INSTALL_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+INSTALL_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 METAEOF
 
     SERVER_IP=$(get_ip)
