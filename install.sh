@@ -85,7 +85,7 @@ pre_check() {
 install_deps() {
     step "安装基础依赖"
     local missing=""
-    for c in curl wget unzip jq openssl; do
+    for c in curl wget unzip jq libjq1 openssl; do
         command -v "$c" &>/dev/null || missing="$missing $c"
     done
     [[ -z "$missing" ]] && { info "所有依赖已就绪"; return; }
@@ -94,16 +94,13 @@ install_deps() {
     local arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
     for pkg in $missing; do
         local url=""
-        # 先试查 apt-cache
         url=$(apt-cache show "$pkg" 2>/dev/null | grep "^Filename:" | head -1 | awk -v base="http://deb.debian.org/debian" '{print base"/"$2}')
-        # 不行就用 apt --print-uris
         [[ -z "$url" ]] && url=$(apt-get install --print-uris -y "$pkg" 2>/dev/null | grep "^'" | head -1 | cut -d"'" -f2)
-        # 还不行猜路径
         [[ -z "$url" ]] && case $pkg in
             curl)  url="http://deb.debian.org/debian/pool/main/c/curl/curl_*_${arch}.deb" ;;
             wget)  url="http://deb.debian.org/debian/pool/main/w/wget/wget_*_${arch}.deb" ;;
             unzip) url="http://deb.debian.org/debian/pool/main/u/unzip/unzip_*_${arch}.deb" ;;
-            jq)    url="http://deb.debian.org/debian/pool/main/j/jq/jq_*_${arch}.deb" ;;
+            jq|libjq1) url="http://deb.debian.org/debian/pool/main/j/jq/jq_*_${arch}.deb" ;;
             openssl) url="http://deb.debian.org/debian/pool/main/o/openssl/openssl_*_${arch}.deb" ;;
         esac
 
