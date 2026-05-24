@@ -654,9 +654,11 @@ is_installed() {
     [[ -f "$XRAY_BIN" && -f "$XRAY_CONFIG" ]]
 }
 
-# 加载节点信息
+# 加载节点信息（兼容旧版不带引号的 INSTALL_TIME）
 load_node_info() {
     if [[ -f "$XRAY_DIR/.node-info" ]]; then
+        # 先修复旧版不带引号的时间戳
+        sed -i 's/^INSTALL_TIME=\([^"].*[^"]\)$/INSTALL_TIME="\1"/' "$XRAY_DIR/.node-info" 2>/dev/null
         source "$XRAY_DIR/.node-info"
     fi
 }
