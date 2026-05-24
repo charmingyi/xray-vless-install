@@ -8,7 +8,7 @@
 ## 快速开始
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/charmingyi/xray-vless-install/main/install.sh)
+bash <(curl -sL https://cdn.jsdelivr.net/gh/charmingyi/xray-vless-install@main/install.sh)
 ```
 
 ### 节点管理
