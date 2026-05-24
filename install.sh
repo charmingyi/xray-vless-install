@@ -370,6 +370,112 @@ config_encryption() {
 }
 
 #=============================================================================
+# REALITY + Encryption 双层 (防探测 + 后量子加密)
+#=============================================================================
+config_reality_encryption() {
+    step "配置 REALITY + VLESS Encryption (双层)"
+
+    local port=${1:-443}
+    read -rp "$(ask "端口 (默认 $port): ")" i; port=${i:-$port}
+    is_valid_port "$port" || error "无效端口"
+
+    # REALITY 密钥对
+    local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
+    local pk; pk=$(echo "$keys" | grep -oP 'PrivateKey:\s*\K\S+')
+    local pbk; pbk=$(echo "$keys" | grep -oP 'Password:\s*\K\S+')
+    [[ -z "$pk" ]] && error "REALITY 密钥生成失败"
+
+    # VLESS Encryption 密钥对 (ML-KEM-768)
+    local out dec enc
+    out=$("$XRAY_BIN" vlessenc 2>/dev/null || true)
+    dec=$(echo "$out" | grep -oP '"decryption": "\K[^"]*' | tail -1)
+    enc=$(echo "$out" | grep -oP '"encryption": "\K[^"]*' | tail -1)
+    [[ -z "$dec" || -z "$enc" ]] && error "vlessenc 密钥生成失败"
+    dec="${dec/.native./.random.}"
+    enc="${enc/.native./.random.}"
+
+    local uuid; uuid=$("$XRAY_BIN" uuid 2>/dev/null)
+    local sid; sid=$(random_hex 8)
+
+    echo ""
+    echo "  REALITY 伪装站点:"
+    echo "    1. www.microsoft.com  2. www.apple.com"
+    echo "    3. www.amazon.com     4. cloudflare.com  5. 自定义"
+    read -rp "$(ask "选择 [1-5] (默认 1): ")" dc
+    local dest sni; case ${dc:-1} in
+        1) dest="www.microsoft.com:443"; sni="www.microsoft.com";;
+        2) dest="www.apple.com:443"; sni="www.apple.com";;
+        3) dest="www.amazon.com:443"; sni="www.amazon.com";;
+        4) dest="cloudflare.com:443"; sni="cloudflare.com";;
+        5) read -rp "$(ask "目标 (host:port): ")" dest; sni="${dest%:*}";;
+        *) dest="www.microsoft.com:443"; sni="www.microsoft.com";;
+    esac
+
+    local ip; ip=$(get_ip)
+
+    # 追加 inbounds (兼容已有节点)
+    local cfg new_inbound
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        cfg=$(cat "$XRAY_CONFIG")
+    else
+        cfg='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"blocked"}]}'
+    fi
+
+    new_inbound=$(jq -n --argjson port "$port" --arg uuid "$uuid" \
+        --arg dec "$dec" --arg enc "$enc" --arg priv "$pk" \
+        --arg dest "$dest" --arg sni "$sni" --arg sid "$sid" \
+    '{
+      port: $port, protocol: "vless", tag: "vless-pq-real-in-\($port)",
+      settings: {
+        clients: [{ id: $uuid }],
+        decryption: $dec,
+        encryption: $enc,
+        selectedAuth: "ML-KEM-768, Post-Quantum"
+      },
+      streamSettings: {
+        network: "tcp",
+        security: "reality",
+        realitySettings: {
+          show: false, dest: $dest, xver: 0,
+          serverNames: [$sni], privateKey: $priv,
+          shortIds: [$sid]
+        }
+      }
+    }')
+
+    echo "$cfg" | jq --argjson new "$new_inbound" \
+        'if .inbounds == null then .inbounds = [] else . end | .inbounds += [$new]' > "$XRAY_CONFIG"
+
+    # 元信息
+    jq -n --arg type "reality-enc" --argjson port "$port" --arg uuid "$uuid" \
+          --arg sni "$sni" --arg pbk "$pbk" --arg pk "$pk" --arg sid "$sid" \
+          --arg dest "$dest" --arg enc "$enc" --arg dec "$dec" \
+          --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+    '{
+      type: $type, port: $port, uuid: $uuid, sni: $sni,
+      pbk: $pbk, pk: $pk, sid: $sid, dest: $dest,
+      encryption: $enc, decryption: $dec,
+      ip: $ip, time: $time
+    }' > "$NODE_INFO"
+
+    # 分享链接 (REALITY + PQ)
+    local disp=$ip; [[ "$ip" =~ ":" ]] && disp="[$ip]"
+    local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&security=reality&sni=${sni}&pbk=${pbk}&sid=${sid}&fp=chrome&type=tcp&headerType=none#VLESS-PQ-REALITY-${port}"
+    echo "$link" > "$XRAY_DIR/vless-link.txt"
+
+    echo ""
+    echo -e "${GREEN}══════════ REALITY + Encryption (双层) ══════════${NC}"
+    echo -e "  地址:   ${CYAN}$ip${NC}          端口: ${CYAN}$port${NC}"
+    echo -e "  UUID:   ${CYAN}$uuid${NC}"
+    echo -e "  伪装:   ${CYAN}$sni${NC}    指纹: chrome"
+    echo -e "  REALITY公钥: ${CYAN}$pbk${NC}"
+    echo -e "  PQ加密: ${CYAN}ML-KEM-768${NC} (${#enc} chars)"
+    echo ""
+    echo -e "${BOLD}分享链接 (可直接导入):${NC}"
+    echo -e "${GREEN}$link${NC}"
+}
+
+#=============================================================================
 # VLESS 基础版
 #=============================================================================
 config_basic() {
@@ -466,6 +572,18 @@ view_config() {
         local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&type=tcp&security=none#VLESS-PQ-${port}"
         echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
         echo "$link" > "$XRAY_DIR/vless-link.txt"
+    elif [[ "$type" == "reality-enc" ]]; then
+        local sni pbk sid enc
+        sni=$(echo "$info" | jq -r '.sni//empty')
+        pbk=$(echo "$info" | jq -r '.pbk//empty')
+        sid=$(echo "$info" | jq -r '.sid//empty')
+        enc=$(echo "$info" | jq -r '.encryption//empty')
+        echo -e "  SNI: ${CYAN}$sni${NC}    公钥: ${CYAN}$pbk${NC}"
+        echo -e "  ShortId: ${CYAN}$sid${NC}    PQ: ${CYAN}$(echo "$enc" | wc -c) chars${NC}"
+        local disp=$ip; [[ "$ip" =~ ":" ]] && disp="[$ip]"
+        local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&security=reality&sni=${sni}&pbk=${pbk}&sid=${sid}&fp=chrome&type=tcp&headerType=none#VLESS-PQ-REALITY-${port}"
+        echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
+        echo "$link" > "$XRAY_DIR/vless-link.txt"
     elif [[ "$type" == "basic" ]]; then
         local link="vless://${uuid}@${ip}:${port}?encryption=none&type=tcp&security=none#VLESS-Basic-${port}"
         echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
@@ -537,13 +655,15 @@ main_menu() {
             echo "  1. 安装 VLESS + REALITY"
             echo "  2. 安装 VLESS + Encryption (PQ)"
             echo "  3. 安装 VLESS 基础版"
+            echo "  4. 安装 REALITY + Encryption (双层)"
             echo "  0. 退出"
             echo ""
-            read -rp "  请选择 [0-3]: " c
+            read -rp "  请选择 [0-4]: " c
             case $c in
                 1) config_reality; setup_firewall; setup_service; setup_bbr;;
                 2) config_encryption; setup_firewall; setup_service; setup_bbr;;
                 3) config_basic; setup_firewall; setup_service; setup_bbr;;
+                4) config_reality_encryption; setup_firewall; setup_service; setup_bbr;;
                 0) exit 0;;
                 *) echo "无效"; sleep 1;;
             esac
@@ -554,35 +674,37 @@ main_menu() {
         echo "  1. 新增 REALITY 节点"
         echo "  2. 新增 Encryption 节点"
         echo "  3. 新增 基础版 节点"
+        echo "  4. 新增 REALITY + Encryption (双层)"
         echo ""
         show_separator "节点管理"
-        echo "  4. 查看状态 & 连接数"
-        echo "  5. 查看/导出 分享链接"
-        echo "  6. 删除节点"
-        echo "  7. 重置 REALITY 密钥"
-        echo "  8. 重启 Xray"
-        echo "  9. 停止/启动"
-        echo "  10. 实时日志"
+        echo "  5. 查看状态 & 连接数"
+        echo "  6. 查看/导出 分享链接"
+        echo "  7. 删除节点"
+        echo "  8. 重置 REALITY 密钥"
+        echo "  9. 重启 Xray"
+        echo "  10. 停止/启动"
+        echo "  11. 实时日志"
         echo ""
         show_separator "工具"
-        echo "  11. 更新 Xray 核心"
-        echo "  12. 创建快捷命令 xr"
+        echo "  12. 更新 Xray 核心"
+        echo "  13. 创建快捷命令 xr"
         echo "  0. 退出"
         echo ""
-        read -rp "  请选择 [0-12]: " c
+        read -rp "  请选择 [0-13]: " c
         case $c in
             1) config_reality; setup_firewall; restart_svc;;
             2) config_encryption; setup_firewall; restart_svc;;
             3) config_basic; setup_firewall; restart_svc;;
-            4) show_status; press_key;;
-            5) view_config; press_key;;
-            6) delete_node;;
-            7) regen_reality_keys;;
-            8) restart_svc; press_key;;
-            9) toggle_svc; press_key;;
-            10) view_log;;
-            11) install_xray; restart_svc; press_key;;
-            12) create_alias; press_key;;
+            4) config_reality_encryption; setup_firewall; restart_svc;;
+            5) show_status; press_key;;
+            6) view_config; press_key;;
+            7) delete_node;;
+            8) regen_reality_keys;;
+            9) restart_svc; press_key;;
+            10) toggle_svc; press_key;;
+            11) view_log;;
+            12) install_xray; restart_svc; press_key;;
+            13) create_alias; press_key;;
             0) exit 0;;
             *) echo "无效"; sleep 1;;
         esac
@@ -629,7 +751,7 @@ regen_reality_keys() {
 
     # 更新 node-info
     jq --arg pk "$new_pk" --arg pbk "$new_pbk" \
-       'if .type=="reality" then .pk=$pk | .pbk=$pbk else . end' \
+       'if .type=="reality" or .type=="reality-enc" then .pk=$pk | .pbk=$pbk else . end' \
        "$NODE_INFO" > "${NODE_INFO}.tmp" 2>/dev/null && mv "${NODE_INFO}.tmp" "$NODE_INFO"
 
     restart_svc
