@@ -172,6 +172,15 @@ install_deps() {
 install_xray() {
     step "安装 Xray-core 最新版"
 
+    # 先停掉旧服务，否则 cp 会 Text file busy
+    if systemctl is-active --quiet xray 2>/dev/null; then
+        systemctl stop xray 2>/dev/null
+        info "已停止旧 xray 服务"
+    fi
+    # 暴力杀掉可能残留的进程
+    pkill -f "/usr/local/bin/xray" 2>/dev/null || true
+    sleep 1
+
     # 不依赖 jq，用 python3 或 grep 解析版本
     local api_resp=$(curl -sL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null)
     XRAY_VERSION=$(echo "$api_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null \
