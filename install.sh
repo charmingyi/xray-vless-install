@@ -484,99 +484,152 @@ restart_svc() {
     info "Xray 已重启"
 }
 
-manage_menu() {
+#=============================================================================
+# 主菜单 (mack-a 风格)
+#=============================================================================
+SCRIPT_VER="2.0.0"
+
+show_header() {
+    clear
+    local xver; xver=$("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}' || echo "未安装")
+    local svc="未运行"; if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl is-active --quiet xray 2>/dev/null; then svc="运行中"; fi
+
+    echo -e "${BOLD}${CYAN}"
+    echo "=============================================================="
+    echo -e "  作者: JJQQA / David Tao           版本: ${SCRIPT_VER}"
+    echo "  Github: https://github.com/charmingyi/xray-vless-install"
+    echo "  描述: VLESS REALITY / Encryption(PQ) 一键管理"
+    echo "=============================================================="
+    echo -e "${NC}"
+    echo -e "  Xray: ${GREEN}${xver}${NC}    状态: ${GREEN}${svc}${NC}"
+
+    # 已安装节点列表
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        jq -r '.inbounds[] | "  [\(.protocol | ascii_upcase)] 端口:\(.port)  \(.tag)"' "$XRAY_CONFIG" 2>/dev/null
+    else
+        echo -e "  ${YELLOW}尚未安装任何节点${NC}"
+    fi
+    echo "=============================================================="
+}
+
+show_separator() {
+    echo "-------------------------${1:-}-----------------------------"
+}
+
+main_menu() {
     while true; do
+        show_header
         echo ""
-        echo -e "${BOLD}╔══════════════════ 节点管理 ══════════════════╗${NC}"
-        echo "  1. 查看状态      5. 查看实时日志"
-        echo "  2. 查看配置      6. 更新 Xray"
-        echo "  3. 重启服务      7. 更新 GeoData"
-        echo "  4. 停止/启动     0. 返回"
-        echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}"
-        read -rp "$(ask "选择 [0-7]: ")" c
+        local has=false; [[ -f "$XRAY_BIN" && -f "$XRAY_CONFIG" ]] && has=true
+
+        if ! $has; then
+            echo "  1. 安装 VLESS + REALITY"
+            echo "  2. 安装 VLESS + Encryption (PQ)"
+            echo "  3. 安装 VLESS 基础版"
+            echo "  0. 退出"
+            echo ""
+            read -rp "  请选择 [0-3]: " c
+            case $c in
+                1) config_reality; setup_firewall; setup_service; setup_bbr;;
+                2) config_encryption; setup_firewall; setup_service; setup_bbr;;
+                3) config_basic; setup_firewall; setup_service; setup_bbr;;
+                0) exit 0;;
+                *) echo "无效"; sleep 1;;
+            esac
+            continue
+        fi
+
+        # === 已安装菜单 ===
+        echo "  1. 新增 REALITY 节点"
+        echo "  2. 新增 Encryption 节点"
+        echo "  3. 新增 基础版 节点"
+        echo ""
+        show_separator "节点管理"
+        echo "  4. 查看节点状态 & 连接数"
+        echo "  5. 查看/导出 分享链接"
+        echo "  6. 重启 Xray 服务"
+        echo "  7. 停止/启动 服务"
+        echo "  8. 查看实时日志"
+        echo ""
+        show_separator "工具"
+        echo "  9. 更新 Xray 核心"
+        echo "  10. 安装 BBR 优化"
+        echo "  11. 卸载脚本"
+        echo ""
+        show_separator "脚本"
+        echo "  12. 创建快捷命令 xr"
+        echo "  0. 退出"
+        echo ""
+        read -rp "  请选择 [0-12]: " c
         case $c in
-            1) show_status;;
-            2) view_config;;
-            3) restart_svc;;
-            4) if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-                   systemctl is-active --quiet xray && { systemctl stop xray; info "已停止"; } || { systemctl start xray; info "已启动"; }
-               else
-                   rc-service xray status 2>/dev/null | grep -qi started && { rc-service xray stop; info "已停止"; } || { rc-service xray start; info "已启动"; }
-               fi;;
-            5) journalctl -u xray -f --no-pager -n 50 2>/dev/null || tail -F /var/log/xray/*.log 2>/dev/null || echo "无日志";;
-            6) install_xray; restart_svc;;
-            7) install_geodata; restart_svc;;
-            0) break;;
-            *) echo "无效";;
+            1) config_reality; setup_firewall; restart_svc;;
+            2) config_encryption; setup_firewall; restart_svc;;
+            3) config_basic; setup_firewall; restart_svc;;
+            4) show_status; press_key;;
+            5) view_config; press_key;;
+            6) restart_svc; press_key;;
+            7) toggle_svc; press_key;;
+            8) view_log;;
+            9) install_xray; restart_svc; press_key;;
+            10) setup_bbr; press_key;;
+            11) uninstall_xray;;
+            12) create_alias; press_key;;
+            0) exit 0;;
+            *) echo "无效"; sleep 1;;
         esac
     done
 }
 
-#=============================================================================
-# 安装入口
-#=============================================================================
-install_menu() {
-    local has_config=false
-    [[ -f "$XRAY_BIN" && -f "$XRAY_CONFIG" ]] && has_config=true
+press_key() { echo ""; read -n 1 -s -rp "按任意键返回..."; echo ""; }
 
-    clear
-    echo -e "${BOLD}${CYAN}"
-    echo "╔══════════════════════════════════════════════════════╗"
-    echo "║     Xray VLESS 一键安装 & 管理                      ║"
-    echo "║     REALITY | Encryption | 基础版                   ║"
-    echo "╚══════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-
-    if $has_config; then
-        local info; info=$(load_node_json)
-        local t; t=$(echo "$info" | jq -r '.type//"?"')
-        local p; p=$(echo "$info" | jq -r '.port//"?"')
-        echo -e "  节点: ${GREEN}$t${NC}  端口: ${CYAN}$p${NC}"
-        echo ""
-        echo "  1. 管理面板       3. 新增节点"
-        echo "  2. 查看分享链接   0. 退出"
-        echo ""
-        read -rp "$(ask "选择 [0-3] (默认 1): ")" c
-        case ${c:-1} in
-            1) manage_menu; exit 0;;
-            2) view_config; exit 0;;
-            3)
-                # 新增节点：选协议 → 写配置 → 重启
-                choose_protocol
-                setup_firewall
-                if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart xray; else rc-service xray restart; fi
-                info "新节点已生效"
-                exit 0
-                ;;
-            0) exit 0;;
-            *) manage_menu; exit 0;;
-        esac
+toggle_svc() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl is-active --quiet xray && { systemctl stop xray; info "已停止"; } || { systemctl start xray; info "已启动"; }
+    else
+        rc-service xray status 2>/dev/null | grep -qi started && { rc-service xray stop; info "已停止"; } || { rc-service xray start; info "已启动"; }
     fi
-
-    choose_protocol
 }
 
-choose_protocol() {
-    echo ""
-    echo "  1. VLESS + REALITY    (伪装 HTTPS)"
-    echo "  2. VLESS + Encryption (PQ - CDN/中转)"
-    echo "  3. VLESS 基础版"
-    echo ""
-    read -rp "$(ask "选择 [1-3]: ")" c
-    case $c in
-        1) config_reality;;
-        2) config_encryption;;
-        3) config_basic;;
-        *) error "无效选择";;
-    esac
+view_log() {
+    echo -e "${YELLOW}实时日志 Ctrl+C 退出...${NC}"
+    journalctl -u xray -f --no-pager -n 50 2>/dev/null || tail -F /var/log/xray/*.log 2>/dev/null
 }
 
+uninstall_xray() {
+    read -rp "确定卸载 Xray? [y/N]: " c
+    [[ ! $c =~ ^[yY]$ ]] && return
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl stop xray 2>/dev/null; systemctl disable xray 2>/dev/null; rm -f /etc/systemd/system/xray.service; systemctl daemon-reload
+    else
+        rc-service xray stop 2>/dev/null; rc-update del xray 2>/dev/null; rm -f /etc/init.d/xray
+    fi
+    rm -f "$XRAY_BIN" "$XRAY_CONFIG" "$NODE_INFO"
+    rm -rf "$XRAY_DIR" "$XRAY_LOG" /usr/local/share/xray
+    rm -f /usr/local/bin/xr
+    success "已卸载"
+}
+
+create_alias() {
+    local script_url="https://raw.githubusercontent.com/charmingyi/xray-vless-install/109dcb5/install.sh"
+    echo "#!/bin/bash" > /usr/local/bin/xr
+    echo "bash <(curl -sL $script_url)" >> /usr/local/bin/xr
+    chmod +x /usr/local/bin/xr
+    success "快捷命令已创建: 输入 xr 打开管理面板"
+}
+
+restart_svc() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart xray; else rc-service xray restart; fi
+    sleep 1; info "Xray 已重启"
+}
+
+#=============================================================================
 main() {
     pre_check
 
-    # 已安装 → 直接进菜单，不碰任何服务
+    # 已安装 → 只检查依赖，然后进菜单
     if [[ -f "$XRAY_BIN" && -f "$XRAY_CONFIG" ]]; then
-        install_menu
+        for c in curl jq; do command -v "$c" &>/dev/null || { install_deps; break; }; done
+        main_menu
         exit 0
     fi
 
@@ -584,15 +637,7 @@ main() {
     install_deps
     install_xray
     install_geodata
-    install_menu
-    setup_firewall
-    setup_service
-    setup_bbr
-
-    echo ""
-    echo -e "${GREEN}══════════════ 安装完成 ══════════════${NC}"
-    echo -e "  管理: ${CYAN}curl ... | bash${NC}"
-    echo -e "  配置: ${CYAN}$XRAY_CONFIG${NC}"
+    main_menu
 }
 
 main "$@"
