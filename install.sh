@@ -351,7 +351,7 @@ METAEOF
 }
 
 #=============================================================================
-# VLESS Encryption 配置 (PR #5067)
+# VLESS Encryption 配置 (PR #5067) — 基于 xray vlessenc 官方命令
 #=============================================================================
 config_encryption() {
     step "配置 VLESS + Encryption (PR #5067)"
@@ -363,37 +363,52 @@ config_encryption() {
     UUID=$("$XRAY_BIN" uuid 2>/dev/null)
     [[ -z "$UUID" ]] && error "生成 UUID 失败"
 
-    # 生成加密密钥
-    info "生成 ML-KEM-768 后量子密钥..."
-    MLKEM_OUTPUT=$("$XRAY_BIN" mlkem768 2>/dev/null)
-    MLKEM_SEED=$(echo "$MLKEM_OUTPUT" | grep -oP 'Seed:\s*\K\S+')
+    # 用 xray vlessenc 命令生成密钥对（decryption + encryption）
+    info "生成 ML-KEM-768 后量子密钥对 (xray vlessenc)..."
+    local vlessenc_out
+    vlessenc_out=$("$XRAY_BIN" vlessenc 2>/dev/null || true)
 
-    if [[ -z "$MLKEM_SEED" ]]; then
-        warn "mlkem768 命令不支持，降级使用 x25519"
-        X25519_OUTPUT=$("$XRAY_BIN" x25519 2>/dev/null)
-        MLKEM_SEED=$(echo "$X25519_OUTPUT" | grep -oP 'PrivateKey:\s*\K\S+')
+    VLESS_DECRYPTION=$(echo "$vlessenc_out" | awk '/"decryption":/ {gsub(/^.*"decryption": *"/,""); gsub(/".*/,""); print; exit}')
+    VLESS_ENCRYPTION=$(echo "$vlessenc_out" | awk '/"encryption":/ {gsub(/^.*"encryption": *"/,""); gsub(/".*/,""); print; exit}')
+
+    # 降级: 如果 vlessenc 不可用，用 mlkem768
+    if [[ -z "$VLESS_DECRYPTION" || -z "$VLESS_ENCRYPTION" ]]; then
+        warn "vlessenc 不可用，降级使用 xray mlkem768..."
+
+        # 加密模式
+        echo ""
+        echo -e "${YELLOW}VLESS Encryption 加密模式:${NC}"
+        echo "  1. native  - 原始格式包"
+        echo "  2. xorpub  - 混淆公钥部分"
+        echo "  3. random  - 全随机外观 (推荐)"
+        read -rp "$(ask "选择 [1-3] (默认: 3): ")" enc_choice
+        case ${enc_choice:-3} in
+            1) ENC_MODE="native" ;;
+            2) ENC_MODE="xorpub" ;;
+            *) ENC_MODE="random" ;;
+        esac
+
+        read -rp "$(ask "Ticket 复用时间(秒) / 1rtt (默认: 600s): ")" ticket_time
+        ticket_time=${ticket_time:-"600s"}
+
+        MLKEM_OUTPUT=$("$XRAY_BIN" mlkem768 2>/dev/null)
+        MLKEM_SEED=$(echo "$MLKEM_OUTPUT" | grep -oP 'Seed:\s*\K\S+')
+        if [[ -z "$MLKEM_SEED" ]]; then
+            X25519_OUTPUT=$("$XRAY_BIN" x25519 2>/dev/null)
+            MLKEM_SEED=$(echo "$X25519_OUTPUT" | grep -oP 'PrivateKey:\s*\K\S+')
+        fi
+        [[ -z "$MLKEM_SEED" ]] && error "生成加密密钥失败"
+
+        VLESS_DECRYPTION="mlkem768x25519plus.${ENC_MODE}.${ticket_time}.100-111-1111.75-0-111.50-0-3333.${MLKEM_SEED}"
+        VLESS_ENCRYPTION="$VLESS_DECRYPTION"
     fi
-    [[ -z "$MLKEM_SEED" ]] && error "生成加密密钥失败"
 
-    # 加密模式
-    echo ""
-    echo -e "${YELLOW}VLESS Encryption 加密模式:${NC}"
-    echo "  1. native  - 原始格式包 (头部有公钥特征)"
-    echo "  2. xorpub  - 混淆公钥部分"
-    echo "  3. random  - 全随机外观 (类似 VMess/SS)"
-    read -rp "$(ask "选择 [1-3] (默认: 3): ")" enc_choice
-    case ${enc_choice:-3} in
-        1) ENC_MODE="native" ;;
-        2) ENC_MODE="xorpub" ;;
-        *) ENC_MODE="random" ;;
-    esac
+    # 关键: native → random 转换，提高客户端兼容性
+    VLESS_DECRYPTION="${VLESS_DECRYPTION/.native./.random.}"
+    VLESS_ENCRYPTION="${VLESS_ENCRYPTION/.native./.random.}"
 
-    read -rp "$(ask "Ticket 复用时间(秒) / 1rtt 禁止复用 (默认: 600s): ")" ticket_time
-    ticket_time=${ticket_time:-"600s"}
-
-    DECRYPTION="mlkem768x25519plus.${ENC_MODE}.${ticket_time}.100-111-1111.75-0-111.50-0-3333.${MLKEM_SEED}"
-
-    info "Decryption: ${DECRYPTION:0:80}..."
+    info "decryption: ${VLESS_DECRYPTION:0:60}..."
+    info "encryption (分享链接用): ${VLESS_ENCRYPTION:0:60}..."
 
     PROTO_TYPE="encryption"
 
@@ -408,14 +423,19 @@ config_encryption() {
     {
       "port": $PORT,
       "protocol": "vless",
-      "tag": "vless-in",
+      "tag": "vless-enc-in",
       "settings": {
         "clients": [
           {
             "id": "$UUID"
           }
         ],
-        "decryption": "$DECRYPTION"
+        "decryption": "$VLESS_DECRYPTION",
+        "encryption": "$VLESS_ENCRYPTION",
+        "selectedAuth": "ML-KEM-768, Post-Quantum"
+      },
+      "streamSettings": {
+        "network": "tcp"
       }
     }
   ],
@@ -432,44 +452,18 @@ JSONEOF
 TYPE=$PROTO_TYPE
 PORT=$PORT
 UUID=$UUID
-ENC_MODE=$ENC_MODE
-TICKET=$ticket_time
-DECRYPTION=$DECRYPTION
+ENC_KEY=$VLESS_ENCRYPTION
+DEC_KEY=$VLESS_DECRYPTION
 INSTALL_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 METAEOF
 
     SERVER_IP=$(get_ip)
+    local display_ip=$SERVER_IP
+    [[ "$SERVER_IP" =~ ":" ]] && display_ip="[$SERVER_IP]"
 
-    # 生成客户端 JSON（decryption 在 settings 级，不在 users 里）
-    CLIENT_JSON=$(cat << CLIENTEOF
-{
-  "outbounds": [
-    {
-      "protocol": "vless",
-      "settings": {
-        "vnext": [
-          {
-            "address": "$SERVER_IP",
-            "port": $PORT,
-            "users": [
-              {
-                "id": "$UUID",
-                "encryption": "none"
-              }
-            ]
-          }
-        ],
-        "decryption": "$DECRYPTION"
-      },
-      "streamSettings": {
-        "network": "raw"
-      }
-    }
-  ]
-}
-CLIENTEOF
-)
-    echo "$CLIENT_JSON" > "$XRAY_DIR/client-config.json"
+    # 分享链接: vless://uuid@ip:port?encryption=<enc_key>&type=tcp&security=none#name
+    VLESS_LINK="vless://${UUID}@${display_ip}:${PORT}?encryption=${VLESS_ENCRYPTION}&type=tcp&security=none#VLESS-PQ-$(hostname 2>/dev/null || echo 'VPS')"
+    echo "$VLESS_LINK" > "$XRAY_DIR/vless-link.txt"
 
     echo ""
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
@@ -479,14 +473,26 @@ CLIENTEOF
     echo -e "  地址:       ${CYAN}$SERVER_IP${NC}"
     echo -e "  端口:       ${CYAN}$PORT${NC}"
     echo -e "  UUID:       ${CYAN}$UUID${NC}"
-    echo -e "  加密模式:   ${CYAN}$ENC_MODE${NC}"
-    echo -e "  Ticket:     ${CYAN}$ticket_time${NC}"
     echo ""
-    echo -e "${BOLD}客户端配置已保存到:${NC}"
-    echo -e "  ${GREEN}$XRAY_DIR/client-config.json${NC}"
+    echo -e "${BOLD}VLESS 分享链接 (可直接导入):${NC}"
+    echo -e "${GREEN}$VLESS_LINK${NC}"
     echo ""
-    echo -e "${BOLD}客户端 JSON (复制到 v2rayN/NekoBox 出站设置):${NC}"
-    echo -e "${GREEN}$CLIENT_JSON${NC}"
+    echo -e "${BOLD}客户端 JSON 配置:${NC}"
+    cat << CLIENTJSON
+{
+  "outbounds": [{
+    "protocol": "vless",
+    "settings": {
+      "vnext": [{
+        "address": "$SERVER_IP",
+        "port": $PORT,
+        "users": [{ "id": "$UUID", "encryption": "none" }]
+      }]
+    },
+    "streamSettings": { "network": "tcp", "security": "none" }
+  }]
+}
+CLIENTJSON
     echo ""
     echo -e "${YELLOW}⚠ VLESS Encryption 适合 CDN / 中转 / non-TLS${NC}"
     echo -e "${YELLOW}  直接过墙请用 VLESS + REALITY 方案${NC}"
