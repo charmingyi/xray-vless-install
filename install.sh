@@ -301,8 +301,9 @@ config_encryption() {
     out=$("$XRAY_BIN" vlessenc 2>/dev/null || true)
 
     # 提取 decryption（服务端用）和 encryption（客户端分享链接用）
-    dec=$(echo "$out" | sed -n '/"decryption":/ {s/.*"decryption": *"//; s/".*//; p; q}')
-    enc=$(echo "$out" | sed -n '/"encryption":/ {s/.*"encryption": *"//; s/".*//; p; q}')
+    # vlessenc 会输出 X25519 和 ML-KEM-768 两套，取最后一套（后量子）
+    dec=$(echo "$out" | grep -oP '"decryption": "\K[^"]*' | tail -1)
+    enc=$(echo "$out" | grep -oP '"encryption": "\K[^"]*' | tail -1)
 
     if [[ -z "$dec" || -z "$enc" ]]; then
         # vlessenc 不可用，用 mlkem768 直出长密钥
