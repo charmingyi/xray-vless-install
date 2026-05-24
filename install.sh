@@ -296,14 +296,24 @@ config_encryption() {
 
     local uuid; uuid=$("$XRAY_BIN" uuid 2>/dev/null)
 
-    # 用 xray vlessenc 官方命令
+    # 用 xray vlessenc 生成密钥对
     local out dec enc
     out=$("$XRAY_BIN" vlessenc 2>/dev/null || true)
-    dec=$(echo "$out" | awk '/"decryption":/ {gsub(/^.*"decryption": *"/,""); gsub(/".*/,""); print; exit}')
-    enc=$(echo "$out" | awk '/"encryption":/ {gsub(/^.*"encryption": *"/,""); gsub(/".*/,""); print; exit}')
+
+    # 提取 decryption（服务端用）和 encryption（客户端分享链接用）
+    dec=$(echo "$out" | sed -n '/"decryption":/ {s/.*"decryption": *"//; s/".*//; p; q}')
+    enc=$(echo "$out" | sed -n '/"encryption":/ {s/.*"encryption": *"//; s/".*//; p; q}')
 
     if [[ -z "$dec" || -z "$enc" ]]; then
-        error "xray vlessenc 失败，请确认 Xray 版本 >= v25.3.6"
+        # vlessenc 不可用，用 mlkem768 直出长密钥
+        warn "vlessenc 失败，用 mlkem768 直出密钥..."
+        local mlkem_out; mlkem_out=$("$XRAY_BIN" mlkem768 2>/dev/null)
+        local seed client
+        seed=$(echo "$mlkem_out" | grep -oP 'Seed:\s*\K\S+')
+        client=$(echo "$mlkem_out" | grep -oP 'Client:\s*\K\S+')
+        [[ -z "$seed" ]] && error "mlkem768 密钥生成失败"
+        dec="mlkem768x25519plus.random.600s.100-111-1111.75-0-111.50-0-3333.${seed}"
+        enc="mlkem768x25519plus.random.600s.100-111-1111.75-0-111.50-0-3333.${client}"
     fi
 
     # native -> random
@@ -548,16 +558,17 @@ main_menu() {
         echo "  4. 查看状态 & 连接数"
         echo "  5. 查看/导出 分享链接"
         echo "  6. 删除节点"
-        echo "  7. 重启 Xray"
-        echo "  8. 停止/启动"
-        echo "  9. 实时日志"
+        echo "  7. 重置 REALITY 密钥"
+        echo "  8. 重启 Xray"
+        echo "  9. 停止/启动"
+        echo "  10. 实时日志"
         echo ""
         show_separator "工具"
-        echo "  10. 更新 Xray 核心"
-        echo "  11. 创建快捷命令 xr"
+        echo "  11. 更新 Xray 核心"
+        echo "  12. 创建快捷命令 xr"
         echo "  0. 退出"
         echo ""
-        read -rp "  请选择 [0-11]: " c
+        read -rp "  请选择 [0-12]: " c
         case $c in
             1) config_reality; setup_firewall; restart_svc;;
             2) config_encryption; setup_firewall; restart_svc;;
@@ -565,11 +576,12 @@ main_menu() {
             4) show_status; press_key;;
             5) view_config; press_key;;
             6) delete_node;;
-            7) restart_svc; press_key;;
-            8) toggle_svc; press_key;;
-            9) view_log;;
-            10) install_xray; restart_svc; press_key;;
-            11) create_alias; press_key;;
+            7) regen_reality_keys;;
+            8) restart_svc; press_key;;
+            9) toggle_svc; press_key;;
+            10) view_log;;
+            11) install_xray; restart_svc; press_key;;
+            12) create_alias; press_key;;
             0) exit 0;;
             *) echo "无效"; sleep 1;;
         esac
@@ -592,6 +604,35 @@ delete_node() {
     jq --argjson p "$p" 'del(.inbounds[] | select(.port==$p))' "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
     restart_svc
     success "端口 $p 已删除"
+    press_key
+}
+
+regen_reality_keys() {
+    echo ""
+    local count; count=$(jq '[.inbounds[] | select(.streamSettings.security=="reality")] | length' "$XRAY_CONFIG" 2>/dev/null || echo 0)
+    [[ "$count" -eq 0 ]] && { warn "没有 REALITY 节点"; press_key; return; }
+    echo -e "  找到 ${GREEN}${count}${NC} 个 REALITY 节点"
+    read -rp "  确定重置所有 REALITY 密钥对? [y/N]: " c
+    [[ ! $c =~ ^[yY]$ ]] && return
+
+    local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
+    local new_pk; new_pk=$(echo "$keys" | grep -oP 'PrivateKey:\s*\K\S+')
+    local new_pbk; new_pbk=$(echo "$keys" | grep -oP 'Password:\s*\K\S+')
+    [[ -z "$new_pk" ]] && { error "密钥生成失败"; return; }
+
+    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+    jq --arg pk "$new_pk" --arg pbk "$new_pbk" \
+       '(.inbounds[] | select(.streamSettings.security=="reality") | .streamSettings.realitySettings.privateKey) = $pk' \
+       "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" 2>/dev/null
+    mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
+
+    # 更新 node-info
+    jq --arg pk "$new_pk" --arg pbk "$new_pbk" \
+       'if .type=="reality" then .pk=$pk | .pbk=$pbk else . end' \
+       "$NODE_INFO" > "${NODE_INFO}.tmp" 2>/dev/null && mv "${NODE_INFO}.tmp" "$NODE_INFO"
+
+    restart_svc
+    success "REALITY 密钥已重置，查看分享链接获取新 pbk"
     press_key
 }
 
