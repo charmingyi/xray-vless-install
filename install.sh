@@ -26,6 +26,25 @@ readonly XRAY_CONFIG="$XRAY_DIR/config.json"
 readonly XRAY_LOG="/var/log/xray"
 readonly NODE_INFO="$XRAY_DIR/.node-info"
 
+# --- 兼容旧版 key=value 格式 .node-info ---
+load_node_json() {
+    if [[ ! -f "$NODE_INFO" ]]; then echo '{}'; return; fi
+    if jq -e . "$NODE_INFO" &>/dev/null; then
+        cat "$NODE_INFO"
+    else
+        # 旧格式: TYPE=reality PORT=443 UUID=xxx ...
+        local t=$(grep -oP '^TYPE=\K.*' "$NODE_INFO" 2>/dev/null || echo "?")
+        local p=$(grep -oP '^PORT=\K.*' "$NODE_INFO" 2>/dev/null || echo "?")
+        local u=$(grep -oP '^UUID=\K.*' "$NODE_INFO" 2>/dev/null || echo "?")
+        local sni=$(grep -oP '^SNI=\K.*' "$NODE_INFO" 2>/dev/null || echo "")
+        local pbk=$(grep -oP '^PUBLIC_KEY=\K.*' "$NODE_INFO" 2>/dev/null || echo "")
+        local sid=$(grep -oP '^SHORT_ID=\K.*' "$NODE_INFO" 2>/dev/null || echo "")
+        local enc=$(grep -oP '^ENC_KEY=\K.*' "$NODE_INFO" 2>/dev/null || echo "")
+        jq -n --arg t "$t" --arg p "$p" --arg u "$u" --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg enc "$enc" \
+          '{type: $t, port: $p, uuid: $u, sni: $sni, pbk: $pbk, sid: $sid, encryption: $enc}'
+    fi
+}
+
 #=============================================================================
 # 工具
 #=============================================================================
@@ -413,7 +432,7 @@ setup_bbr() {
 # 管理菜单
 #=============================================================================
 view_config() {
-    local info; info=$(cat "$NODE_INFO" 2>/dev/null) || { warn "无节点信息"; return; }
+    local info; info=$(load_node_json) || { warn "无节点信息"; return; }
     local type; type=$(echo "$info" | jq -r '.type//empty')
     local port; port=$(echo "$info" | jq -r '.port//empty')
     local uuid; uuid=$(echo "$info" | jq -r '.uuid//empty')
@@ -512,7 +531,7 @@ install_menu() {
     echo -e "${NC}"
 
     if $has_config; then
-        local info; info=$(cat "$NODE_INFO" 2>/dev/null || echo '{}')
+        local info; info=$(load_node_json)
         local t; t=$(echo "$info" | jq -r '.type//"?"')
         local p; p=$(echo "$info" | jq -r '.port//"?"')
         echo -e "  已安装: ${GREEN}$t${NC}  端口: ${CYAN}$p${NC}"
