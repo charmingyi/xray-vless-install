@@ -124,16 +124,43 @@ install_deps() {
         done
     fi
 
-    # 二次确认
+    # 二次确认：apt 失败则直接从 deb.debian.org 下载 .deb 安装
     local still_missing=""
     for cmd in curl wget unzip socat python3; do
         command -v "$cmd" &>/dev/null || still_missing="$still_missing $cmd"
     done
     if [[ -n "$still_missing" ]]; then
-        warn "以下依赖仍未安装:${still_missing}"
-        warn "可能是源不可达。尝试强制更新源后重试..."
-        apt-get update -o Acquire::ForceIPv4=true 2>/dev/null || true
-        apt-get install -y --no-install-recommends $still_missing 2>/dev/null || true
+        warn "apt 安装失败，直接从 deb.debian.org 下载 .deb..."
+        local arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+        local codename=$(grep VERSION_CODENAME /etc/os-release 2>/dev/null | cut -d= -f2)
+        [[ -z "$codename" ]] && codename="bookworm"
+        local deb_base="http://deb.debian.org/debian/pool/main"
+
+        for pkg in $still_missing; do
+            # 映射包名到 .deb URL（常见依赖）
+            case $pkg in
+                curl)    deb_url="$deb_base/c/curl/curl_*_${arch}.deb" ;;
+                wget)    deb_url="$deb_base/w/wget/wget_*_${arch}.deb" ;;
+                unzip)   deb_url="$deb_base/u/unzip/unzip_*_${arch}.deb" ;;
+                socat)   deb_url="$deb_base/s/socat/socat_*_${arch}.deb" ;;
+                python3) deb_url="$deb_base/p/python3-defaults/python3_*_${arch}.deb" ;;
+                *)       continue ;;
+            esac
+            # 用 apt-cache 查确切版本号
+            local real_url=$(apt-cache show "$pkg" 2>/dev/null | grep "^Filename:" | head -1 | awk '{print "http://deb.debian.org/debian/"$2}')
+            if [[ -z "$real_url" ]]; then
+                real_url=$(apt-get install --print-uris -y "$pkg" 2>/dev/null | grep "^'" | head -1 | cut -d"'" -f2)
+            fi
+            if [[ -n "$real_url" ]]; then
+                echo -e "  ${CYAN}下载 $pkg...${NC}"
+                curl -#L --connect-timeout 10 "$real_url" -o "/tmp/${pkg}.deb" 2>/dev/null && {
+                    dpkg -i "/tmp/${pkg}.deb" 2>/dev/null && echo -e "  ${GREEN}▸${NC} $pkg 安装成功" || true
+                    rm -f "/tmp/${pkg}.deb"
+                }
+            fi
+        done
+        # 修复可能的中断依赖
+        apt-get install -f -y --no-install-recommends 2>/dev/null || true
     fi
 
     info "依赖安装完成"
@@ -433,6 +460,12 @@ METAEOF
     echo -e "  UUID:       ${CYAN}$UUID${NC}"
     echo -e "  加密模式:   ${CYAN}$ENC_MODE${NC}"
     echo -e "  Ticket:     ${CYAN}$ticket_time${NC}"
+    echo ""
+    echo -e "${BOLD}VLESS 分享链接:${NC}"
+    echo -e "${GREEN}vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&type=raw#VLESS-Enc-${ENC_MODE}-$(hostname 2>/dev/null || echo 'VPS')${NC}"
+    echo ""
+    echo -e "  ${YELLOW}⚠ 客户端需在 outbound settings 中配置 decryption 字段:${NC}"
+    echo -e "  ${YELLOW}   ${DECRYPTION:0:70}...${NC}"
     echo ""
     echo -e "${YELLOW}⚠ VLESS Encryption 适合 CDN / 中转 / non-TLS${NC}"
     echo -e "${YELLOW}  直接过墙请用 VLESS + REALITY 方案${NC}"
@@ -880,15 +913,17 @@ main_menu() {
     echo "  1. VLESS + REALITY    (推荐 - 直接过墙, 伪装流量)"
     echo "  2. VLESS + Encryption (PR #5067 - 后量子加密, CDN/中转)"
     echo "  3. VLESS 基础版       (明文, 不推荐)"
-    echo "  4. 退出"
+    echo "  4. 节点管理"
+    echo "  5. 退出"
     echo ""
-    read -rp "$(ask "请选择 [1-4]: ")" choice
+    read -rp "$(ask "请选择 [1-5]: ")" choice
 
     case $choice in
         1) config_type="reality" ;;
         2) config_type="encryption" ;;
         3) config_type="basic" ;;
-        4) echo "退出"; exit 0 ;;
+        4) if is_installed; then manage_menu; exit 0; else warn "未检测到已安装节点，请先安装"; exit 1; fi ;;
+        5) echo "退出"; exit 0 ;;
         *) error "无效选择" ;;
     esac
 }
