@@ -545,35 +545,31 @@ main_menu() {
         echo "  3. 新增 基础版 节点"
         echo ""
         show_separator "节点管理"
-        echo "  4. 查看节点状态 & 连接数"
+        echo "  4. 查看状态 & 连接数"
         echo "  5. 查看/导出 分享链接"
-        echo "  6. 重启 Xray 服务"
-        echo "  7. 停止/启动 服务"
-        echo "  8. 查看实时日志"
+        echo "  6. 删除节点"
+        echo "  7. 重启 Xray"
+        echo "  8. 停止/启动"
+        echo "  9. 实时日志"
         echo ""
         show_separator "工具"
-        echo "  9. 更新 Xray 核心"
-        echo "  10. 安装 BBR 优化"
-        echo "  11. 卸载脚本"
-        echo ""
-        show_separator "脚本"
-        echo "  12. 创建快捷命令 xr"
+        echo "  10. 更新 Xray 核心"
+        echo "  11. 创建快捷命令 xr"
         echo "  0. 退出"
         echo ""
-        read -rp "  请选择 [0-12]: " c
+        read -rp "  请选择 [0-11]: " c
         case $c in
             1) config_reality; setup_firewall; restart_svc;;
             2) config_encryption; setup_firewall; restart_svc;;
             3) config_basic; setup_firewall; restart_svc;;
             4) show_status; press_key;;
             5) view_config; press_key;;
-            6) restart_svc; press_key;;
-            7) toggle_svc; press_key;;
-            8) view_log;;
-            9) install_xray; restart_svc; press_key;;
-            10) setup_bbr; press_key;;
-            11) uninstall_xray;;
-            12) create_alias; press_key;;
+            6) delete_node;;
+            7) restart_svc; press_key;;
+            8) toggle_svc; press_key;;
+            9) view_log;;
+            10) install_xray; restart_svc; press_key;;
+            11) create_alias; press_key;;
             0) exit 0;;
             *) echo "无效"; sleep 1;;
         esac
@@ -581,6 +577,23 @@ main_menu() {
 }
 
 press_key() { echo ""; read -n 1 -s -rp "按任意键返回..."; echo ""; }
+
+delete_node() {
+    echo ""
+    jq -r '.inbounds[] | "  [\(.port)] \(.tag)  (\(.protocol | ascii_upcase))"' "$XRAY_CONFIG" 2>/dev/null
+    echo ""
+    read -rp "  输入要删除的端口号: " p
+    [[ -z "$p" ]] && return
+    local tag; tag=$(jq -r --argjson p "$p" '.inbounds[] | select(.port==$p) | .tag' "$XRAY_CONFIG")
+    [[ -z "$tag" ]] && { warn "端口 $p 不存在"; return; }
+    read -rp "  确定删除端口 $p [$tag]? [y/N]: " c
+    [[ ! $c =~ ^[yY]$ ]] && return
+    cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
+    jq --argjson p "$p" 'del(.inbounds[] | select(.port==$p))' "$XRAY_CONFIG" > "${XRAY_CONFIG}.tmp" && mv "${XRAY_CONFIG}.tmp" "$XRAY_CONFIG"
+    restart_svc
+    success "端口 $p 已删除"
+    press_key
+}
 
 toggle_svc() {
     if [[ "$INIT_SYSTEM" == "systemd" ]]; then
