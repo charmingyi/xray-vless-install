@@ -610,7 +610,7 @@ uninstall_xray() {
 }
 
 create_alias() {
-    local script_url="https://raw.githubusercontent.com/charmingyi/xray-vless-install/109dcb5/install.sh"
+    local script_url="https://raw.githubusercontent.com/charmingyi/xray-vless-install/e3634cb/install.sh"
     echo "#!/bin/bash" > /usr/local/bin/xr
     echo "bash <(curl -sL $script_url)" >> /usr/local/bin/xr
     chmod +x /usr/local/bin/xr
