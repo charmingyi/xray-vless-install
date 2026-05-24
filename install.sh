@@ -1,225 +1,190 @@
 #!/bin/bash
 #=============================================================================
 # Xray VLESS 一键安装 & 管理脚本
-# 支持: VLESS + REALITY | VLESS + Encryption (PR #5067) | VLESS 基础版
-# Author: JJQQA / David Tao
-# License: MIT
+# 支持: REALITY | Encryption (PR #5067 / xray vlessenc) | 基础版
+# 架构参照 Xray vlessenc 官方命令 + 多节点共存
 # Repo: https://github.com/charmingyi/xray-vless-install
 #=============================================================================
+set -euo pipefail
 
-set -eo pipefail
-
-#=============================================================================
-# 颜色 & 常量
-#=============================================================================
-RED='\033[31m'; GREEN='\033[32m'; YELLOW='\033[33m'; BLUE='\033[34m'
-CYAN='\033[36m'; BOLD='\033[1m'; NC='\033[0m'
+# --- 颜色 ---
+readonly RED='\e[91m' GREEN='\e[92m' YELLOW='\e[93m'
+readonly CYAN='\e[96m' MAGENTA='\e[95m' NC='\e[0m'
+readonly BOLD='\e[1m'
 
 info()    { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-error()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
-step()    { echo -e "\n${BOLD}${BLUE}==>${NC}${BOLD} $*${NC}"; }
-ask()     { echo -e "${CYAN}[?]${NC} $*"; }
+error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+step()    { echo -e "\n${BOLD}==>${NC}${BOLD} $*${NC}"; }
+success() { echo -e "${GREEN}[OK]${NC}  $*"; }
+ask()     { echo -ne "${CYAN}[?]${NC} $* "; }
 
-# 常量路径
-XRAY_DIR="/usr/local/etc/xray"
-XRAY_LOG="/var/log/xray"
-XRAY_CONFIG="$XRAY_DIR/config.json"
-XRAY_BIN="/usr/local/bin/xray"
-
-#=============================================================================
-# 通用的 JSON 读取（优先 jq，降级 python3）
-#=============================================================================
-json_get() {
-    local key="$1" file="${2:-$XRAY_CONFIG}"
-    if command -v jq &>/dev/null; then
-        jq -r "$key" "$file" 2>/dev/null
-    elif command -v python3 &>/dev/null; then
-        python3 -c "import json; d=json.load(open('$file')); print(d$key)" 2>/dev/null
-    else
-        grep -oP "(?<=\"${key##*.}\": )\"?[^\",}]*\"?" "$file" 2>/dev/null | head -1 | tr -d '"'
-    fi
-}
+# --- 路径 ---
+readonly XRAY_DIR="/usr/local/etc/xray"
+readonly XRAY_BIN="/usr/local/bin/xray"
+readonly XRAY_CONFIG="$XRAY_DIR/config.json"
+readonly XRAY_LOG="/var/log/xray"
+readonly NODE_INFO="$XRAY_DIR/.node-info"
 
 #=============================================================================
-# 获取服务器公网 IP（强制 IPv4）
+# 工具
 #=============================================================================
+random_hex() { openssl rand -hex "${1:-8}" 2>/dev/null || head -c "$(( ${1:-8} * 2 ))" /dev/urandom | xxd -p; }
+random_port() { echo $(( RANDOM % 30000 + 10000 )); }
+is_valid_port() { [[ "$1" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]; }
+is_valid_uuid() { [[ "$1" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; }
+
 get_ip() {
-    curl -s4 ifconfig.me 2>/dev/null \
-        || curl -s4 ip.sb 2>/dev/null \
-        || curl -s4 icanhazip.com 2>/dev/null \
-        || echo 'YOUR_IP'
+    for u in "https://api.ipify.org" "https://ip.sb" "https://checkip.amazonaws.com"; do
+        local ip=$(curl -4s --max-time 5 "$u" 2>/dev/null) && [[ -n "$ip" ]] && echo "$ip" && return
+    done
+    echo "YOUR_IP"
 }
 
 #=============================================================================
-# 预检
+# 系统检测
 #=============================================================================
+detect_system() {
+    if [[ -f /etc/os-release ]]; then . /etc/os-release; else OS_ID="unknown"; fi
+    if command -v systemctl &>/dev/null; then INIT_SYSTEM="systemd"
+    elif command -v rc-service &>/dev/null; then INIT_SYSTEM="openrc"
+    else INIT_SYSTEM="unknown"; fi
+}
+
 pre_check() {
-    step "环境检查"
-
-    [[ $EUID -ne 0 ]] && error "请用 root 用户运行: sudo bash install.sh"
-    local arch=$(uname -m)
-    [[ "$arch" != "x86_64" && "$arch" != "aarch64" ]] && error "仅支持 x86_64 / arm64 架构"
-
-    # 检测包管理器
-    if command -v apt-get &>/dev/null; then
-        PKG_MGR="apt-get"
-        PKG_UPDATE="apt-get update"
-        PKG_INSTALL="apt-get install -y"
-    elif command -v yum &>/dev/null; then
-        PKG_MGR="yum"
-        PKG_UPDATE="yum makecache"
-        PKG_INSTALL="yum install -y"
-    elif command -v dnf &>/dev/null; then
-        PKG_MGR="dnf"
-        PKG_UPDATE="dnf makecache"
-        PKG_INSTALL="dnf install -y"
-    else
-        error "未检测到 apt-get / yum / dnf，不支持此系统"
-    fi
-    info "系统: $(grep ^PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)"
-    info "架构: $arch | 包管理: $PKG_MGR"
+    [[ $(id -u) != 0 ]] && error "请用 root 运行"
+    [[ $(uname -s) != "Linux" ]] && error "仅支持 Linux"
+    local m=$(uname -m)
+    [[ "$m" != "x86_64" && "$m" != "aarch64" && "$m" != "amd64" ]] && error "仅支持 x86_64 / arm64"
+    detect_system
+    info "系统: ${PRETTY_NAME:-$OS_ID} | 架构: $(uname -m) | 服务: $INIT_SYSTEM"
 }
 
 #=============================================================================
-# 安装依赖（缺啥直接从 deb.debian.org 下 .deb，不碰 apt 源）
+# 依赖安装（缺啥直接 curl .deb，不碰 apt 源）
 #=============================================================================
 install_deps() {
     step "安装基础依赖"
-
-    local pkgs_missing=""
-
-    for cmd in curl wget unzip socat python3; do
-        command -v "$cmd" &>/dev/null || pkgs_missing="$pkgs_missing $cmd"
+    local missing=""
+    for c in curl wget unzip jq openssl; do
+        command -v "$c" &>/dev/null || missing="$missing $c"
     done
-    [[ ! -f /etc/ssl/certs/ca-certificates.crt ]] && pkgs_missing="$pkgs_missing ca-certificates"
-
-    if [[ -z "$pkgs_missing" ]]; then
-        info "所有依赖已就绪，跳过安装"
-        return
-    fi
-
-    info "缺少:${pkgs_missing}"
+    [[ -z "$missing" ]] && { info "所有依赖已就绪"; return; }
+    info "缺少:${missing}"
 
     local arch=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
-    local base="http://deb.debian.org/debian"
-
-    for pkg in $pkgs_missing; do
-        # 查 .deb 路径（先试 apt-cache，再试直接安装查 url）
+    for pkg in $missing; do
         local url=""
-        url=$(apt-cache show "$pkg" 2>/dev/null | grep "^Filename:" | head -1 | awk "{print \"$base/\"\$2}")
-        if [[ -z "$url" ]]; then
-            # apt-cache 也要连源，换方案：直接 apt-get --print-uris
-            url=$(apt-get install --print-uris -y "$pkg" 2>/dev/null | grep "^'" | head -1 | cut -d"'" -f2)
-        fi
-        if [[ -z "$url" ]]; then
-            # 最后兜底：猜常见包路径
-            case $pkg in
-                unzip) url="$base/pool/main/u/unzip/unzip_*_${arch}.deb" ;;
-                curl)  url="$base/pool/main/c/curl/curl_*_${arch}.deb" ;;
-                wget)  url="$base/pool/main/w/wget/wget_*_${arch}.deb" ;;
-                socat) url="$base/pool/main/s/socat/socat_*_${arch}.deb" ;;
-                python3) url="$base/pool/main/p/python3-defaults/python3_*_${arch}.deb" ;;
-            esac
-        fi
+        # 先试查 apt-cache
+        url=$(apt-cache show "$pkg" 2>/dev/null | grep "^Filename:" | head -1 | awk -v base="http://deb.debian.org/debian" '{print base"/"$2}')
+        # 不行就用 apt --print-uris
+        [[ -z "$url" ]] && url=$(apt-get install --print-uris -y "$pkg" 2>/dev/null | grep "^'" | head -1 | cut -d"'" -f2)
+        # 还不行猜路径
+        [[ -z "$url" ]] && case $pkg in
+            curl)  url="http://deb.debian.org/debian/pool/main/c/curl/curl_*_${arch}.deb" ;;
+            wget)  url="http://deb.debian.org/debian/pool/main/w/wget/wget_*_${arch}.deb" ;;
+            unzip) url="http://deb.debian.org/debian/pool/main/u/unzip/unzip_*_${arch}.deb" ;;
+            jq)    url="http://deb.debian.org/debian/pool/main/j/jq/jq_*_${arch}.deb" ;;
+            openssl) url="http://deb.debian.org/debian/pool/main/o/openssl/openssl_*_${arch}.deb" ;;
+        esac
 
-        echo -e "  ${CYAN}下载 $pkg...${NC}"
+        echo -ne "  ${CYAN}下载 $pkg...${NC}"
         if curl -fsSL --connect-timeout 10 --retry 2 "$url" -o "/tmp/${pkg}.deb" 2>/dev/null; then
-            dpkg -i "/tmp/${pkg}.deb" 2>/dev/null && echo -e "  ${GREEN}▸${NC} $pkg 安装成功" || true
+            dpkg -i "/tmp/${pkg}.deb" &>/dev/null && echo -e " ${GREEN}OK${NC}" || echo -e " ${RED}FAIL${NC}"
             rm -f "/tmp/${pkg}.deb"
         else
-            warn "$pkg 下载失败，尝试 apt 兜底..."
+            echo -e " ${YELLOW}直下失败, apt兜底${NC}"
             timeout 30 apt-get install -y --no-install-recommends "$pkg" 2>/dev/null || true
         fi
     done
-
-    # 修复依赖
     timeout 30 apt-get install -f -y --no-install-recommends 2>/dev/null || true
 
-    # 最后确认
-    local still=""
-    for cmd in curl wget unzip socat python3; do
-        command -v "$cmd" &>/dev/null || still="$still $cmd"
+    for c in curl wget unzip jq openssl; do
+        command -v "$c" &>/dev/null || error "无法安装 $c，请手动安装"
     done
-    if [[ -n "$still" ]]; then
-        error "无法安装:${still}，请手动安装后重试"
-    fi
-
-    info "依赖安装完成"
+    success "依赖就绪"
 }
 
 #=============================================================================
-# 安装 Xray-core
+# Xray 核心安装
 #=============================================================================
 install_xray() {
-    step "安装 Xray-core 最新版"
+    step "安装 Xray-core"
 
-    # 先停掉旧服务，否则 cp 会 Text file busy
-    if systemctl is-active --quiet xray 2>/dev/null; then
-        systemctl stop xray 2>/dev/null
-        info "已停止旧 xray 服务"
+    # 停旧服务避免 Text file busy
+    if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl is-active --quiet xray 2>/dev/null; then
+        systemctl stop xray; info "已停止旧服务"
     fi
-    # 暴力杀掉可能残留的进程
-    pkill -f "/usr/local/bin/xray" 2>/dev/null || true
-    sleep 1
+    pkill -f "$XRAY_BIN" 2>/dev/null || true; sleep 1
 
-    # 不依赖 jq，用 python3 或 grep 解析版本
-    local api_resp=$(curl -sL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null)
-    XRAY_VERSION=$(echo "$api_resp" | python3 -c "import json,sys; print(json.load(sys.stdin).get('tag_name',''))" 2>/dev/null \
-        || echo "$api_resp" | grep -oP '"tag_name":\s*"\K[^"]+' 2>/dev/null \
-        || echo "")
+    local arch; case $(uname -m) in x86_64|amd64) arch="64";; aarch64|arm64) arch="arm64-v8a";; esac
 
-    [[ -z "$XRAY_VERSION" ]] && XRAY_VERSION="v25.3.6"
-    info "最新版本: $XRAY_VERSION"
+    # 版本: 先试 API 再 fallback
+    local tag; tag=$(curl -sL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+        | jq -r '.tag_name//empty' 2>/dev/null)
+    [[ -z "$tag" || "$tag" == "null" ]] && tag="v26.3.27"
+    info "版本: $tag"
 
-    # 架构映射
-    case $(uname -m) in
-        x86_64)  ARCH="64" ;;
-        aarch64) ARCH="arm64-v8a" ;;
-        *)       error "不支持的架构" ;;
-    esac
-
-    DOWNLOAD_URL="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${ARCH}.zip"
-
-    TMPDIR=$(mktemp -d)
-    cd "$TMPDIR"
-
-    echo -e "${CYAN}下载中... $DOWNLOAD_URL${NC}"
-    curl -#L "$DOWNLOAD_URL" -o xray.zip || error "下载 Xray 失败"
-    unzip -q xray.zip
-    echo -e "${GREEN}▸${NC} 解压完成"
-
-    mkdir -p /usr/local/share/xray
-    cp xray "$XRAY_BIN"
-    chmod +x "$XRAY_BIN"
-    cp geoip.dat geosite.dat /usr/local/share/xray/ 2>/dev/null || true
-
-    [[ ! -f "$XRAY_BIN" ]] && error "Xray 安装失败"
-
-    INSTALLED_VER=$("$XRAY_BIN" version 2>&1 | head -1 | grep -oP 'v?\d+\.\d+\.\d+' || echo "unknown")
-    info "Xray 已安装: $INSTALLED_VER"
-
-    cd /tmp && rm -rf "$TMPDIR"
+    local tmpd=$(mktemp -d)
+    curl -#L "https://github.com/XTLS/Xray-core/releases/download/${tag}/Xray-linux-${arch}.zip" -o "$tmpd/xray.zip" || error "下载失败"
+    unzip -qo "$tmpd/xray.zip" -d "$tmpd"
+    install -m 0755 "$tmpd/xray" "$XRAY_BIN"
+    mkdir -p "$XRAY_DIR" /usr/local/share/xray "$XRAY_LOG"
+    cp "$tmpd/geoip.dat" "$tmpd/geosite.dat" /usr/local/share/xray/ 2>/dev/null || true
+    rm -rf "$tmpd"
+    success "Xray $tag 已安装"
 }
 
 #=============================================================================
-# 目录结构
+# GeoData (Loyalsoldier 版，更全)
 #=============================================================================
-setup_dirs() {
-    mkdir -p "$XRAY_DIR" "$XRAY_LOG"
-    info "配置目录: $XRAY_DIR"
+install_geodata() {
+    step "更新 GeoData"
+    curl -fsSL -o /usr/local/share/xray/geoip.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"
+    curl -fsSL -o /usr/local/share/xray/geosite.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"
+    success "GeoData 已更新"
 }
 
 #=============================================================================
-# 工具函数: 生成随机字符串
+# 服务安装
 #=============================================================================
-random_hex() {
-    local len=${1:-16}
-    openssl rand -hex "$len" 2>/dev/null || head -c $((len*2)) /dev/urandom | xxd -p
-}
+setup_service() {
+    step "配置服务"
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        cat > /etc/systemd/system/xray.service << 'UEOF'
+[Unit]
+Description=Xray Service
+After=network-online.target
+Wants=network-online.target
 
-random_port() {
-    echo $(( RANDOM % 30000 + 10000 ))
+[Service]
+User=root
+ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+NoNewPrivileges=false
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UEOF
+        systemctl daemon-reload; systemctl enable --now xray
+    else
+        cat > /etc/init.d/xray << 'IEOF'
+#!/sbin/openrc-run
+name="xray"
+command="/usr/local/bin/xray"
+command_args="run -config /usr/local/etc/xray/config.json"
+command_background=true
+pidfile="/run/xray.pid"
+start_stop_daemon_args="--make-pidfile --background"
+depend() { need net; use dns; }
+IEOF
+        chmod +x /etc/init.d/xray; rc-update add xray default; rc-service xray restart || rc-service xray start
+    fi
+    sleep 2
+    success "服务已启动"
 }
 
 #=============================================================================
@@ -228,753 +193,374 @@ random_port() {
 config_reality() {
     step "配置 VLESS + REALITY"
 
-    PORT=${REALITY_PORT:-$(random_port)}
-    read -rp "$(ask "VLESS 端口 (默认: $PORT): ")" input
-    PORT=${input:-$PORT}
+    local port=${1:-$(random_port)}
+    read -rp "$(ask "端口 (默认 $port): ")" i; port=${i:-$port}
+    is_valid_port "$port" || error "无效端口"
 
-    # 生成 REALITY 密钥对
-    info "生成 REALITY X25519 密钥对..."
-    REALITY_KEYS=$("$XRAY_BIN" x25519 2>/dev/null)
-    PRIVATE_KEY=$(echo "$REALITY_KEYS" | grep -oP 'PrivateKey:\s*\K\S+')
-    PUBLIC_KEY=$(echo "$REALITY_KEYS" | grep -oP 'Password:\s*\K\S+')
-    [[ -z "$PRIVATE_KEY" ]] && error "生成 REALITY 密钥失败"
+    local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
+    local pk; pk=$(echo "$keys" | grep -oP 'PrivateKey:\s*\K\S+')
+    local pbk; pbk=$(echo "$keys" | grep -oP 'Password:\s*\K\S+')
+    [[ -z "$pk" ]] && error "密钥生成失败"
 
-    UUID=$("$XRAY_BIN" uuid 2>/dev/null)
-    [[ -z "$UUID" ]] && error "生成 UUID 失败"
+    local uuid; uuid=$("$XRAY_BIN" uuid 2>/dev/null)
+    local sid; sid=$(random_hex 8); local sid2; sid2=$(random_hex 8)
 
-    SHORT_ID=$(random_hex 8)
-    SHORT_ID2=$(random_hex 8)
-
-    # 目标站点选择
     echo ""
-    echo -e "${YELLOW}REALITY 伪装站点建议 (选一个未被墙的国外大站):${NC}"
-    echo "  1. www.microsoft.com  (推荐)"
-    echo "  2. www.apple.com"
-    echo "  3. www.amazon.com"
-    echo "  4. cloudflare.com"
-    echo "  5. 自定义输入"
-    read -rp "$(ask "选择 [1-5] (默认: 1): ")" dest_choice
-    case ${dest_choice:-1} in
-        1) DEST="www.microsoft.com:443" ; SNI="www.microsoft.com" ;;
-        2) DEST="www.apple.com:443"     ; SNI="www.apple.com" ;;
-        3) DEST="www.amazon.com:443"    ; SNI="www.amazon.com" ;;
-        4) DEST="cloudflare.com:443"    ; SNI="cloudflare.com" ;;
-        5) read -rp "$(ask "输入目标 (如 example.com:443): ")" DEST
-           SNI="${DEST%:*}" ;;
-        *) DEST="www.microsoft.com:443" ; SNI="www.microsoft.com" ;;
+    echo "  REALITY 伪装站点:"
+    echo "    1. www.microsoft.com  2. www.apple.com"
+    echo "    3. www.amazon.com     4. cloudflare.com  5. 自定义"
+    read -rp "$(ask "选择 [1-5] (默认 1): ")" dc
+    local dest sni; case ${dc:-1} in
+        1) dest="www.microsoft.com:443"; sni="www.microsoft.com";;
+        2) dest="www.apple.com:443"; sni="www.apple.com";;
+        3) dest="www.amazon.com:443"; sni="www.amazon.com";;
+        4) dest="cloudflare.com:443"; sni="cloudflare.com";;
+        5) read -rp "$(ask "目标 (host:port): ")" dest; sni="${dest%:*}";;
+        *) dest="www.microsoft.com:443"; sni="www.microsoft.com";;
     esac
-    info "REALITY 伪装目标: $DEST"
 
-    # 保存方案类型
-    PROTO_TYPE="reality"
+    local ip; ip=$(get_ip)
 
-    cat > "$XRAY_CONFIG" << JSONEOF
-{
-  "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
-  },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "protocol": "vless",
-      "tag": "vless-in",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID",
-            "flow": "xtls-rprx-vision"
+    # 写服务端配置
+    jq -n --argjson port "$port" --arg uuid "$uuid" --arg priv "$pk" \
+          --arg dest "$dest" --arg sni "$sni" --arg sid "$sid" --arg sid2 "$sid2" --arg ip "$ip" \
+    '{
+      log: { loglevel: "warning", access: "/var/log/xray/access.log", error: "/var/log/xray/error.log" },
+      inbounds: [{
+        port: $port, protocol: "vless", tag: "vless-reality-in",
+        settings: {
+          clients: [{ id: $uuid, flow: "xtls-rprx-vision" }],
+          decryption: "none"
+        },
+        streamSettings: {
+          network: "raw", security: "reality",
+          realitySettings: {
+            show: false, dest: $dest, xver: 0,
+            serverNames: [$sni], privateKey: $priv,
+            shortIds: [$sid, $sid2]
           }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "raw",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "$DEST",
-          "xver": 0,
-          "serverNames": ["$SNI"],
-          "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORT_ID", "$SHORT_ID2"]
         }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    }
-  ]
-}
-JSONEOF
+      }],
+      outbounds: [{ protocol: "freedom", tag: "direct" }, { protocol: "blackhole", tag: "blocked" }]
+    }' > "$XRAY_CONFIG"
 
-    # 保存元信息
-    cat > "$XRAY_DIR/.node-info" << METAEOF
-TYPE=$PROTO_TYPE
-PORT=$PORT
-UUID=$UUID
-SNI=$SNI
-PUBLIC_KEY=$PUBLIC_KEY
-PRIVATE_KEY=$PRIVATE_KEY
-SHORT_ID=$SHORT_ID
-SHORT_ID2=$SHORT_ID2
-DEST=$DEST
-INSTALL_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
-METAEOF
+    # 元信息
+    jq -n --arg type "reality" --argjson port "$port" --arg uuid "$uuid" \
+          --arg sni "$sni" --arg pbk "$pbk" --arg pk "$pk" --arg sid "$sid" \
+          --arg dest "$dest" --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+    '{
+      type: $type, port: $port, uuid: $uuid, sni: $sni,
+      pbk: $pbk, pk: $pk, sid: $sid, dest: $dest,
+      ip: $ip, time: $time
+    }' > "$NODE_INFO"
 
-    SERVER_IP=$(get_ip)
-    REALITY_LINK="vless://${UUID}@${SERVER_IP}:${PORT}?flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=raw&headerType=none#VLESS-REALITY-$(hostname 2>/dev/null || echo 'VPS')"
-    echo "$REALITY_LINK" > "$XRAY_DIR/vless-link.txt"
+    # 分享链接
+    local link="vless://${uuid}@${ip}:${port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=raw&headerType=none#REALITY-${sni}"
+    echo "$link" > "$XRAY_DIR/vless-link.txt"
 
-    # 打印结果
     echo ""
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${GREEN}  VLESS + REALITY 服务端配置完成!${NC}"
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}════════════════════ VLESS + REALITY ════════════════════${NC}"
+    echo -e "  地址:   ${CYAN}$ip${NC}          端口: ${CYAN}$port${NC}"
+    echo -e "  UUID:   ${CYAN}$uuid${NC}"
+    echo -e "  公钥:   ${CYAN}$pbk${NC}     ShortId: ${CYAN}$sid${NC}"
+    echo -e "  伪装:   ${CYAN}$sni${NC}    指纹: chrome"
     echo ""
-    echo -e "  协议:       ${YELLOW}VLESS + REALITY${NC}"
-    echo -e "  地址:       ${CYAN}$SERVER_IP${NC}"
-    echo -e "  端口:       ${CYAN}$PORT${NC}"
-    echo -e "  UUID:       ${CYAN}$UUID${NC}"
-    echo -e "  Flow:       ${CYAN}xtls-rprx-vision${NC}"
-    echo -e "  PublicKey:  ${CYAN}$PUBLIC_KEY${NC}"
-    echo -e "  ShortId:    ${CYAN}$SHORT_ID${NC}"
-    echo -e "  SNI:        ${CYAN}$SNI${NC}"
-    echo -e "  Fingerprint:${CYAN}chrome${NC}"
-    echo ""
-    echo -e "${BOLD}VLESS 分享链接:${NC}"
-    echo -e "${GREEN}$REALITY_LINK${NC}"
+    echo -e "${BOLD}分享链接:${NC}"
+    echo -e "${GREEN}$link${NC}"
 }
 
 #=============================================================================
-# VLESS Encryption 配置 (PR #5067) — 基于 xray vlessenc 官方命令
+# VLESS Encryption 配置 (xray vlessenc)
 #=============================================================================
 config_encryption() {
-    step "配置 VLESS + Encryption (PR #5067)"
+    step "配置 VLESS + Encryption"
 
-    PORT=${ENC_PORT:-$(random_port)}
-    read -rp "$(ask "VLESS 端口 (默认: $PORT): ")" input
-    PORT=${input:-$PORT}
+    local port=${1:-$(random_port)}
+    read -rp "$(ask "端口 (默认 $port): ")" i; port=${i:-$port}
 
-    UUID=$("$XRAY_BIN" uuid 2>/dev/null)
-    [[ -z "$UUID" ]] && error "生成 UUID 失败"
+    local uuid; uuid=$("$XRAY_BIN" uuid 2>/dev/null)
 
-    # 用 xray vlessenc 命令生成密钥对（decryption + encryption）
-    info "生成 ML-KEM-768 后量子密钥对 (xray vlessenc)..."
-    local vlessenc_out
-    vlessenc_out=$("$XRAY_BIN" vlessenc 2>/dev/null || true)
+    # 用 xray vlessenc 官方命令
+    local out dec enc
+    out=$("$XRAY_BIN" vlessenc 2>/dev/null || true)
+    dec=$(echo "$out" | awk '/"decryption":/ {gsub(/^.*"decryption": *"/,""); gsub(/".*/,""); print; exit}')
+    enc=$(echo "$out" | awk '/"encryption":/ {gsub(/^.*"encryption": *"/,""); gsub(/".*/,""); print; exit}')
 
-    VLESS_DECRYPTION=$(echo "$vlessenc_out" | awk '/"decryption":/ {gsub(/^.*"decryption": *"/,""); gsub(/".*/,""); print; exit}')
-    VLESS_ENCRYPTION=$(echo "$vlessenc_out" | awk '/"encryption":/ {gsub(/^.*"encryption": *"/,""); gsub(/".*/,""); print; exit}')
-
-    # 降级: 如果 vlessenc 不可用，用 mlkem768
-    if [[ -z "$VLESS_DECRYPTION" || -z "$VLESS_ENCRYPTION" ]]; then
-        warn "vlessenc 不可用，降级使用 xray mlkem768..."
-
-        # 加密模式
-        echo ""
-        echo -e "${YELLOW}VLESS Encryption 加密模式:${NC}"
-        echo "  1. native  - 原始格式包"
-        echo "  2. xorpub  - 混淆公钥部分"
-        echo "  3. random  - 全随机外观 (推荐)"
-        read -rp "$(ask "选择 [1-3] (默认: 3): ")" enc_choice
-        case ${enc_choice:-3} in
-            1) ENC_MODE="native" ;;
-            2) ENC_MODE="xorpub" ;;
-            *) ENC_MODE="random" ;;
-        esac
-
-        read -rp "$(ask "Ticket 复用时间(秒) / 1rtt (默认: 600s): ")" ticket_time
-        ticket_time=${ticket_time:-"600s"}
-
-        MLKEM_OUTPUT=$("$XRAY_BIN" mlkem768 2>/dev/null)
-        MLKEM_SEED=$(echo "$MLKEM_OUTPUT" | grep -oP 'Seed:\s*\K\S+')
-        if [[ -z "$MLKEM_SEED" ]]; then
-            X25519_OUTPUT=$("$XRAY_BIN" x25519 2>/dev/null)
-            MLKEM_SEED=$(echo "$X25519_OUTPUT" | grep -oP 'PrivateKey:\s*\K\S+')
-        fi
-        [[ -z "$MLKEM_SEED" ]] && error "生成加密密钥失败"
-
-        VLESS_DECRYPTION="mlkem768x25519plus.${ENC_MODE}.${ticket_time}.100-111-1111.75-0-111.50-0-3333.${MLKEM_SEED}"
-        VLESS_ENCRYPTION="$VLESS_DECRYPTION"
+    if [[ -z "$dec" || -z "$enc" ]]; then
+        error "xray vlessenc 失败，请确认 Xray 版本 >= v25.3.6"
     fi
 
-    # 关键: native → random 转换，提高客户端兼容性
-    VLESS_DECRYPTION="${VLESS_DECRYPTION/.native./.random.}"
-    VLESS_ENCRYPTION="${VLESS_ENCRYPTION/.native./.random.}"
+    # native -> random
+    dec="${dec/.native./.random.}"
+    enc="${enc/.native./.random.}"
 
-    info "decryption: ${VLESS_DECRYPTION:0:60}..."
-    info "encryption (分享链接用): ${VLESS_ENCRYPTION:0:60}..."
+    local ip; ip=$(get_ip)
 
-    PROTO_TYPE="encryption"
+    # 追加 inbounds 配置（兼容已有节点）
+    local cfg new_inbound
+    if [[ -f "$XRAY_CONFIG" ]]; then
+        cfg=$(cat "$XRAY_CONFIG")
+    else
+        cfg='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"blocked"}]}'
+    fi
 
-    cat > "$XRAY_CONFIG" << JSONEOF
-{
-  "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
-  },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "protocol": "vless",
-      "tag": "vless-enc-in",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID"
-          }
-        ],
-        "decryption": "$VLESS_DECRYPTION",
-        "encryption": "$VLESS_ENCRYPTION",
-        "selectedAuth": "ML-KEM-768, Post-Quantum"
+    new_inbound=$(jq -n --argjson port "$port" --arg uuid "$uuid" --arg dec "$dec" --arg enc "$enc" \
+    '{
+      port: $port, protocol: "vless", tag: "vless-pq-in-\($port)",
+      settings: {
+        clients: [{ id: $uuid }],
+        decryption: $dec,
+        encryption: $enc,
+        selectedAuth: "ML-KEM-768, Post-Quantum"
       },
-      "streamSettings": {
-        "network": "tcp"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    }
-  ]
-}
-JSONEOF
+      streamSettings: { network: "tcp" }
+    }')
 
-    cat > "$XRAY_DIR/.node-info" << METAEOF
-TYPE=$PROTO_TYPE
-PORT=$PORT
-UUID=$UUID
-ENC_KEY=$VLESS_ENCRYPTION
-DEC_KEY=$VLESS_DECRYPTION
-INSTALL_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
-METAEOF
+    echo "$cfg" | jq --argjson new "$new_inbound" \
+        'if .inbounds == null then .inbounds = [] else . end | .inbounds += [$new]' > "$XRAY_CONFIG"
 
-    SERVER_IP=$(get_ip)
-    local display_ip=$SERVER_IP
-    [[ "$SERVER_IP" =~ ":" ]] && display_ip="[$SERVER_IP]"
+    # 元信息
+    jq -n --arg type "encryption" --argjson port "$port" --arg uuid "$uuid" \
+          --arg enc "$enc" --arg dec "$dec" --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+    '{
+      type: $type, port: $port, uuid: $uuid,
+      encryption: $enc, decryption: $dec,
+      ip: $ip, time: $time
+    }' > "$NODE_INFO"
 
-    # 分享链接: vless://uuid@ip:port?encryption=<enc_key>&type=tcp&security=none#name
-    VLESS_LINK="vless://${UUID}@${display_ip}:${PORT}?encryption=${VLESS_ENCRYPTION}&type=tcp&security=none#VLESS-PQ-$(hostname 2>/dev/null || echo 'VPS')"
-    echo "$VLESS_LINK" > "$XRAY_DIR/vless-link.txt"
+    # 分享链接
+    local disp=$ip; [[ "$ip" =~ ":" ]] && disp="[$ip]"
+    local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&type=tcp&security=none#VLESS-PQ-${port}"
+    echo "$link" > "$XRAY_DIR/vless-link.txt"
 
     echo ""
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${GREEN}  VLESS + Encryption 服务端配置完成!${NC}"
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}════════════ VLESS + Encryption (PQ) ════════════${NC}"
+    echo -e "  地址:   ${CYAN}$ip${NC}          端口: ${CYAN}$port${NC}"
+    echo -e "  UUID:   ${CYAN}$uuid${NC}"
     echo ""
-    echo -e "  地址:       ${CYAN}$SERVER_IP${NC}"
-    echo -e "  端口:       ${CYAN}$PORT${NC}"
-    echo -e "  UUID:       ${CYAN}$UUID${NC}"
-    echo ""
-    echo -e "${BOLD}VLESS 分享链接 (可直接导入):${NC}"
-    echo -e "${GREEN}$VLESS_LINK${NC}"
-    echo ""
-    echo -e "${BOLD}客户端 JSON 配置:${NC}"
-    cat << CLIENTJSON
-{
-  "outbounds": [{
-    "protocol": "vless",
-    "settings": {
-      "vnext": [{
-        "address": "$SERVER_IP",
-        "port": $PORT,
-        "users": [{ "id": "$UUID", "encryption": "none" }]
-      }]
-    },
-    "streamSettings": { "network": "tcp", "security": "none" }
-  }]
-}
-CLIENTJSON
-    echo ""
-    echo -e "${YELLOW}⚠ VLESS Encryption 适合 CDN / 中转 / non-TLS${NC}"
-    echo -e "${YELLOW}  直接过墙请用 VLESS + REALITY 方案${NC}"
+    echo -e "${BOLD}分享链接 (可直接导入):${NC}"
+    echo -e "${GREEN}$link${NC}"
 }
 
 #=============================================================================
-# VLESS 基础配置
+# VLESS 基础版
 #=============================================================================
 config_basic() {
     step "配置 VLESS 基础版"
 
-    PORT=${BASIC_PORT:-$(random_port)}
-    read -rp "$(ask "VLESS 端口 (默认: $PORT): ")" input
-    PORT=${input:-$PORT}
+    local port=${1:-$(random_port)}
+    read -rp "$(ask "端口 (默认 $port): ")" i; port=${i:-$port}
 
-    UUID=$("$XRAY_BIN" uuid 2>/dev/null)
-    [[ -z "$UUID" ]] && error "生成 UUID 失败"
+    local uuid; uuid=$("$XRAY_BIN" uuid 2>/dev/null)
+    local ip; ip=$(get_ip)
 
-    PROTO_TYPE="basic"
+    local cfg new_inbound
+    if [[ -f "$XRAY_CONFIG" ]]; then cfg=$(cat "$XRAY_CONFIG")
+    else cfg='{"log":{"loglevel":"warning"},"inbounds":[],"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"blocked"}]}'; fi
 
-    cat > "$XRAY_CONFIG" << JSONEOF
-{
-  "log": {
-    "loglevel": "warning",
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log"
-  },
-  "inbounds": [
-    {
-      "port": $PORT,
-      "protocol": "vless",
-      "tag": "vless-in",
-      "settings": {
-        "clients": [
-          {
-            "id": "$UUID"
-          }
-        ],
-        "decryption": "none"
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "tag": "direct"
-    }
-  ]
-}
-JSONEOF
+    new_inbound=$(jq -n --argjson port "$port" --arg uuid "$uuid" \
+    '{
+      port: $port, protocol: "vless", tag: "vless-basic-in-\($port)",
+      settings: { clients: [{ id: $uuid }], decryption: "none" },
+      streamSettings: { network: "tcp" }
+    }')
 
-    cat > "$XRAY_DIR/.node-info" << METAEOF
-TYPE=$PROTO_TYPE
-PORT=$PORT
-UUID=$UUID
-INSTALL_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
-METAEOF
+    echo "$cfg" | jq --argjson new "$new_inbound" \
+        'if .inbounds == null then .inbounds = [] else . end | .inbounds += [$new]' > "$XRAY_CONFIG"
 
-    SERVER_IP=$(get_ip)
+    jq -n --arg type "basic" --argjson port "$port" --arg uuid "$uuid" \
+          --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+    '{ type: $type, port: $port, uuid: $uuid, ip: $ip, time: $time }' > "$NODE_INFO"
 
-    echo ""
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${GREEN}  VLESS 基础版 配置完成!${NC}"
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "  地址:       ${CYAN}$SERVER_IP${NC}"
-    echo -e "  端口:       ${CYAN}$PORT${NC}"
-    echo -e "  UUID:       ${CYAN}$UUID${NC}"
-    echo -e "${YELLOW}⚠ 明文 VLESS 不推荐直接使用${NC}"
+    local link="vless://${uuid}@${ip}:${port}?encryption=none&type=tcp&security=none#VLESS-Basic-${port}"
+    echo "$link" > "$XRAY_DIR/vless-link.txt"
+
+    echo -e "${GREEN}VLESS 基础版已配置${NC}  端口: $port  UUID: $uuid"
+    echo -e "${GREEN}$link${NC}"
 }
 
 #=============================================================================
-# systemd 服务
-#=============================================================================
-setup_service() {
-    step "配置 systemd 服务"
-
-    cat > /etc/systemd/system/xray.service << 'UNITEOF'
-[Unit]
-Description=Xray Service
-Documentation=https://github.com/XTLS/Xray-core
-After=network.target nss-lookup.target
-
-[Service]
-Type=simple
-User=root
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
-Restart=on-failure
-RestartSec=5s
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-UNITEOF
-
-    systemctl daemon-reload
-    systemctl enable xray --now 2>/dev/null
-
-    sleep 2
-    if systemctl is-active --quiet xray 2>/dev/null; then
-        info "Xray 服务运行中 ✓"
-    else
-        warn "Xray 服务启动失败，检查: systemctl status xray"
-        systemctl status xray --no-pager -l 2>/dev/null || true
-    fi
-}
-
-#=============================================================================
-# BBR 优化
-#=============================================================================
-setup_bbr() {
-    step "优化内核参数 (BBR)"
-
-    if lsmod | grep -q tcp_bbr; then
-        info "BBR 已启用"
-    else
-        modprobe tcp_bbr 2>/dev/null || true
-        echo "tcp_bbr" >> /etc/modules-load.d/modules.conf 2>/dev/null || true
-    fi
-
-    local cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-    if [[ "$cc" != "bbr" ]]; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-        sysctl -p > /dev/null 2>&1
-        info "BBR 已设置 ($(sysctl -n net.ipv4.tcp_congestion_control))"
-    else
-        info "BBR 已启用 ($cc)"
-    fi
-}
-
-#=============================================================================
-# 防火墙
+# 防火墙 & BBR
 #=============================================================================
 setup_firewall() {
-    step "配置防火墙"
+    local ports; ports=$(jq -r '[.inbounds[].port] | unique | .[]' "$XRAY_CONFIG" 2>/dev/null)
+    [[ -z "$ports" ]] && return
+    for p in $ports; do
+        if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q active; then
+            ufw allow "$p"/tcp 2>/dev/null || true
+        elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+            firewall-cmd --permanent --add-port="$p"/tcp 2>/dev/null || true
+        fi
+    done
+    command -v firewall-cmd &>/dev/null && firewall-cmd --reload 2>/dev/null || true
+    info "防火墙已放行端口: $(echo $ports | tr '\n' ' ')"
+    echo -e "${YELLOW}⚠ 云防火墙安全组也需放行相同端口${NC}"
+}
 
-    local port=$(grep -oP '(?<="port": )\d+' "$XRAY_CONFIG" | head -1)
-
-    # ufw
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
-        ufw allow "$port"/tcp 2>/dev/null || true
-        info "ufw 已放行端口 $port"
-    fi
-
-    # firewalld
-    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port="$port"/tcp 2>/dev/null || true
-        firewall-cmd --reload 2>/dev/null || true
-        info "firewalld 已放行端口 $port"
-    fi
-
-    echo -e "${YELLOW}⚠ 如果 VPS 有外部防火墙（阿里云/腾讯云安全组），请放行端口: $port${NC}"
+setup_bbr() {
+    lsmod | grep -q tcp_bbr && return
+    modprobe tcp_bbr 2>/dev/null || true
+    echo "tcp_bbr" >> /etc/modules-load.d/modules.conf 2>/dev/null || true
+    grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf || {
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        sysctl -p >/dev/null 2>&1
+    }
+    info "BBR 已启用"
 }
 
 #=============================================================================
-# 显示管理命令
+# 管理菜单
 #=============================================================================
-show_commands() {
-    local port=$(grep -oP '(?<="port": )\d+' "$XRAY_CONFIG" | head -1)
-    echo ""
-    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  Xray 管理命令${NC}"
-    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "  启动/停止/重启: ${GREEN}systemctl start|stop|restart xray${NC}"
-    echo -e "  状态:           ${GREEN}systemctl status xray${NC}"
-    echo -e "  日志:           ${GREEN}journalctl -u xray -f${NC}"
-    echo -e "  重新运行管理:   ${GREEN}bash install.sh --manage${NC}"
-    echo -e "  配置文件:       ${GREEN}$XRAY_CONFIG${NC}"
-    echo -e "  监听端口:       ${CYAN}$port${NC}"
-}
-
-#=============================================================================
-# 汇总信息
-#=============================================================================
-summary() {
-    echo ""
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${GREEN}  安装完成!${NC}"
-    echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-    echo -e "  运行 ${CYAN}bash install.sh --manage${NC} 可管理已搭建的节点"
-}
-
-#=============================================================================
-# ======================  节点管理模块  ========================
-#=============================================================================
-
-# 检测是否已安装
-is_installed() {
-    [[ -f "$XRAY_BIN" && -f "$XRAY_CONFIG" ]]
-}
-
-# 加载节点信息（兼容旧版不带引号的 INSTALL_TIME）
-load_node_info() {
-    if [[ -f "$XRAY_DIR/.node-info" ]]; then
-        # 先修复旧版不带引号的时间戳
-        sed -i 's/^INSTALL_TIME=\([^"].*[^"]\)$/INSTALL_TIME="\1"/' "$XRAY_DIR/.node-info" 2>/dev/null
-        source "$XRAY_DIR/.node-info"
-    fi
-}
-
-# 显示节点状态
-show_status() {
-    echo ""
-    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  节点状态${NC}"
-    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
-
-    # 服务状态
-    if systemctl is-active --quiet xray 2>/dev/null; then
-        echo -e "  Xray 服务:  ${GREEN}● 运行中${NC}"
-    else
-        echo -e "  Xray 服务:  ${RED}● 已停止${NC}"
-    fi
-    echo -e "  启动时间:   $(systemctl show xray -p ActiveEnterTimestamp 2>/dev/null | cut -d= -f2 || echo '未知')"
-
-    # 节点类型
-    load_node_info
-    local type_display="未知"
-    case ${TYPE:-} in
-        reality)    type_display="VLESS + REALITY" ;;
-        encryption) type_display="VLESS + Encryption (PR #5067)" ;;
-        basic)      type_display="VLESS 基础版" ;;
-    esac
-    echo -e "  方案类型:   ${YELLOW}$type_display${NC}"
-
-    local port=$(grep -oP '(?<="port": )\d+' "$XRAY_CONFIG" 2>/dev/null | head -1)
-    echo -e "  监听端口:   ${CYAN}${port:-未知}${NC}"
-
-    if [[ "$TYPE" == "reality" ]]; then
-        echo -e "  伪装 SNI:   ${CYAN}${SNI:-未知}${NC}"
-    elif [[ "$TYPE" == "encryption" ]]; then
-        echo -e "  加密模式:   ${CYAN}${ENC_MODE:-未知}${NC}"
-        echo -e "  Ticket:     ${CYAN}${TICKET:-未知}${NC}"
-    fi
-
-    # 连接数
-    local conns=$(ss -tnp 2>/dev/null | grep -c ":${port:-0} " || echo "0")
-    echo -e "  当前连接:   ${conns}"
-
-    # 流量统计
-    if [[ -f /var/log/xray/access.log ]]; then
-        local lines=$(wc -l < /var/log/xray/access.log 2>/dev/null || echo "0")
-        echo -e "  访问记录:   ${lines} 条"
-    fi
-}
-
-# 查看配置
 view_config() {
-    load_node_info
-    echo ""
-    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${BLUE}  节点配置详情${NC}"
-    echo -e "${BOLD}${BLUE}═══════════════════════════════════════════════════════════${NC}"
-    echo ""
+    local info; info=$(cat "$NODE_INFO" 2>/dev/null) || { warn "无节点信息"; return; }
+    local type; type=$(echo "$info" | jq -r '.type//empty')
+    local port; port=$(echo "$info" | jq -r '.port//empty')
+    local uuid; uuid=$(echo "$info" | jq -r '.uuid//empty')
+    local ip; ip=$(get_ip)
 
-    SERVER_IP=$(get_ip)
-    local port=$(grep -oP '(?<="port": )\d+' "$XRAY_CONFIG" | head -1)
-    local uuid=$(grep -oP '(?<="id": ")[^"]+' "$XRAY_CONFIG" | head -1)
+    echo -e "\n${BOLD}═══ 节点配置 ═══${NC}"
+    echo -e "  类型: ${GREEN}$type${NC}    端口: ${CYAN}$port${NC}"
+    echo -e "  地址: ${CYAN}$ip${NC}    UUID: ${CYAN}$uuid${NC}"
 
-    echo -e "  服务器 IP:  ${CYAN}$SERVER_IP${NC}"
-    echo -e "  端口:       ${CYAN}$port${NC}"
-    echo -e "  UUID:       ${CYAN}$uuid${NC}"
-
-    if [[ "$TYPE" == "reality" ]]; then
-        echo -e "  方案:       ${GREEN}VLESS + REALITY${NC}"
-        echo -e "  Flow:       ${CYAN}xtls-rprx-vision${NC}"
-        echo -e "  PublicKey:  ${CYAN}${PUBLIC_KEY:-}${NC}"
-        echo -e "  ShortId:    ${CYAN}${SHORT_ID:-}${NC}"
-        echo -e "  SNI:        ${CYAN}${SNI:-}${NC}"
-        echo -e "  Fingerprint:${CYAN}chrome${NC}"
-        echo -e "  伪装目标:   ${CYAN}${DEST:-}${NC}"
-
-        # 生成分享链接
-        local link="vless://${uuid}@${SERVER_IP}:${port}?flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=raw&headerType=none#VLESS-REALITY-$(hostname)"
-        echo ""
-        echo -e "${BOLD}分享链接:${NC}"
-        echo -e "${GREEN}$link${NC}"
+    if [[ "$type" == "reality" ]]; then
+        local sni pbk sid
+        sni=$(echo "$info" | jq -r '.sni//empty')
+        pbk=$(echo "$info" | jq -r '.pbk//empty')
+        sid=$(echo "$info" | jq -r '.sid//empty')
+        echo -e "  SNI: ${CYAN}$sni${NC}    公钥: ${CYAN}$pbk${NC}"
+        echo -e "  ShortId: ${CYAN}$sid${NC}"
+        local link="vless://${uuid}@${ip}:${port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=raw&headerType=none#REALITY-${sni}"
+        echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
         echo "$link" > "$XRAY_DIR/vless-link.txt"
-
-    elif [[ "$TYPE" == "encryption" ]]; then
-        echo -e "  方案:       ${GREEN}VLESS + Encryption${NC}"
-        echo -e "  加密模式:   ${CYAN}${ENC_MODE:-}${NC}"
-        echo -e "  Ticket:     ${CYAN}${TICKET:-}${NC}"
-
-    elif [[ "$TYPE" == "basic" ]]; then
-        echo -e "  方案:       ${YELLOW}VLESS 基础版 (明文)${NC}"
+    elif [[ "$type" == "encryption" ]]; then
+        local enc; enc=$(echo "$info" | jq -r '.encryption//empty')
+        local disp=$ip; [[ "$ip" =~ ":" ]] && disp="[$ip]"
+        local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&type=tcp&security=none#VLESS-PQ-${port}"
+        echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
+        echo "$link" > "$XRAY_DIR/vless-link.txt"
+    elif [[ "$type" == "basic" ]]; then
+        local link="vless://${uuid}@${ip}:${port}?encryption=none&type=tcp&security=none#VLESS-Basic-${port}"
+        echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
+        echo "$link" > "$XRAY_DIR/vless-link.txt"
     fi
-
-    echo ""
-    echo -e "  完整配置: ${GREEN}$XRAY_CONFIG${NC}"
 }
 
-# 修改端口
-change_port() {
-    load_node_info
-    local old_port=$(grep -oP '(?<="port": )\d+' "$XRAY_CONFIG" | head -1)
-    echo -e "当前端口: ${YELLOW}$old_port${NC}"
-    read -rp "$(ask "新端口: ")" new_port
-    [[ -z "$new_port" ]] && { info "已取消"; return; }
-    [[ ! "$new_port" =~ ^[0-9]+$ ]] && { warn "无效端口号"; return; }
-
-    sed -i "s/\"port\": $old_port/\"port\": $new_port/" "$XRAY_CONFIG"
-
-    # 更新 node-info
-    if [[ -f "$XRAY_DIR/.node-info" ]]; then
-        sed -i "s/^PORT=.*/PORT=$new_port/" "$XRAY_DIR/.node-info"
-    fi
-
-    systemctl restart xray 2>/dev/null
-    sleep 1
-
-    # 防火墙更新
-    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active"; then
-        ufw delete allow "$old_port"/tcp 2>/dev/null || true
-        ufw allow "$new_port"/tcp 2>/dev/null || true
-    fi
-
-    if systemctl is-active --quiet xray 2>/dev/null; then
-        info "端口已改为 ${GREEN}$new_port${NC}，服务运行中 ✓"
-        echo -e "${YELLOW}⚠ 记得更新云防火墙安全组规则!${NC}"
+show_status() {
+    echo -e "\n${BOLD}═══ 运行状态 ═══${NC}"
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl is-active --quiet xray && echo -e "  Xray: ${GREEN}● 运行中${NC}" || echo -e "  Xray: ${RED}● 已停止${NC}"
     else
-        warn "服务启动失败，检查: systemctl status xray"
+        rc-service xray status 2>/dev/null | grep -qi started && echo -e "  Xray: ${GREEN}● 运行中${NC}" || echo -e "  Xray: ${RED}● 已停止${NC}"
     fi
+    echo -e "  版本: $("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}' || echo '?')"
+
+    local ports; ports=$(jq -r '[.inbounds[].port] | unique | .[]' "$XRAY_CONFIG" 2>/dev/null)
+    for p in $ports; do
+        local conns=$(ss -tnp 2>/dev/null | grep -c ":$p " || echo 0)
+        echo -e "  端口 $p: ${conns} 连接"
+    done
 }
 
-# 查看实时日志
-view_logs() {
-    echo -e "${YELLOW}实时日志 (Ctrl+C 退出)...${NC}"
-    journalctl -u xray -f --no-pager -n 50
+restart_svc() {
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart xray; else rc-service xray restart; fi
+    sleep 1
+    info "Xray 已重启"
 }
 
-# 管理菜单主循环
 manage_menu() {
-    if ! is_installed; then
-        warn "未检测到已安装的 Xray 节点"
-        echo -e "  请先运行: ${CYAN}bash install.sh${NC}"
-        exit 1
-    fi
-
     while true; do
         echo ""
-        echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${BOLD}${BLUE}║     Xray 节点管理                                       ║${NC}"
-        echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════════╝${NC}"
-        echo ""
-        echo "  1. 查看节点状态"
-        echo "  2. 查看完整配置 & 分享链接"
-        echo "  3. 重启 Xray 服务"
-        echo "  4. 停止 Xray 服务"
-        echo "  5. 启动 Xray 服务"
-        echo "  6. 查看实时日志"
-        echo "  7. 修改监听端口"
-        echo "  8. 更新 Xray 核心"
-        echo "  0. 退出"
-        echo ""
-        read -rp "$(ask "请选择 [0-8]: ")" choice
-
-        case $choice in
-            1) show_status ;;
-            2) view_config ;;
-            3)
-                systemctl restart xray 2>/dev/null
-                sleep 1
-                if systemctl is-active --quiet xray; then
-                    info "Xray 已重启 ✓"
-                else
-                    warn "重启失败，查看: journalctl -u xray -n 20"
-                fi
-                ;;
-            4)
-                systemctl stop xray 2>/dev/null
-                info "Xray 已停止"
-                ;;
-            5)
-                systemctl start xray 2>/dev/null
-                sleep 1
-                if systemctl is-active --quiet xray; then
-                    info "Xray 已启动 ✓"
-                else
-                    warn "启动失败"
-                fi
-                ;;
-            6) view_logs ;;
-            7) change_port ;;
-            8)
-                echo -e "${CYAN}重新安装 Xray 最新版...${NC}"
-                install_xray
-                systemctl restart xray 2>/dev/null
-                if systemctl is-active --quiet xray; then
-                    info "Xray 已更新到最新版 ✓"
-                fi
-                ;;
-            0) echo "退出管理"; exit 0 ;;
-            *) echo -e "${RED}无效选择${NC}" ;;
+        echo -e "${BOLD}╔══════════════════ 节点管理 ══════════════════╗${NC}"
+        echo "  1. 查看状态      5. 查看实时日志"
+        echo "  2. 查看配置      6. 更新 Xray"
+        echo "  3. 重启服务      7. 更新 GeoData"
+        echo "  4. 停止/启动     0. 返回"
+        echo -e "${BOLD}╚══════════════════════════════════════════════╝${NC}"
+        read -rp "$(ask "选择 [0-7]: ")" c
+        case $c in
+            1) show_status;;
+            2) view_config;;
+            3) restart_svc;;
+            4) if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+                   systemctl is-active --quiet xray && { systemctl stop xray; info "已停止"; } || { systemctl start xray; info "已启动"; }
+               else
+                   rc-service xray status 2>/dev/null | grep -qi started && { rc-service xray stop; info "已停止"; } || { rc-service xray start; info "已启动"; }
+               fi;;
+            5) journalctl -u xray -f --no-pager -n 50 2>/dev/null || tail -F /var/log/xray/*.log 2>/dev/null || echo "无日志";;
+            6) install_xray; restart_svc;;
+            7) install_geodata; restart_svc;;
+            0) break;;
+            *) echo "无效";;
         esac
     done
 }
 
 #=============================================================================
-# 主菜单
+# 安装入口
 #=============================================================================
-main_menu() {
+install_menu() {
+    local has_config=false
+    [[ -f "$XRAY_BIN" && -f "$XRAY_CONFIG" ]] && has_config=true
+
     clear
-    echo -e "${BOLD}${BLUE}"
+    echo -e "${BOLD}${CYAN}"
     echo "╔══════════════════════════════════════════════════════╗"
     echo "║     Xray VLESS 一键安装 & 管理脚本                  ║"
-    echo "║     支持: REALITY | Encryption(PR#5067) | 基础版    ║"
+    echo "║     REALITY | Encryption(PR#5067) | 基础版          ║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
-    # 检查是否已安装 → 直接进管理，不啰嗦
-    if is_installed; then
-        load_node_info
-        local port=$(grep -oP '(?<="port": )\d+' "$XRAY_CONFIG" | head -1)
-        local type_display="未知"
-        case ${TYPE:-} in
-            reality) type_display="VLESS + REALITY" ;;
-            encryption) type_display="VLESS + Encryption" ;;
-            basic) type_display="VLESS 基础版" ;;
+    if $has_config; then
+        local info; info=$(cat "$NODE_INFO" 2>/dev/null || echo '{}')
+        local t; t=$(echo "$info" | jq -r '.type//"?"')
+        local p; p=$(echo "$info" | jq -r '.port//"?"')
+        echo -e "  已安装: ${GREEN}$t${NC}  端口: ${CYAN}$p${NC}"
+        echo ""
+        echo "  1. 进入管理面板"
+        echo "  2. 新增节点 (追加配置)"
+        echo "  3. 重装 (覆盖)"
+        echo ""
+        read -rp "$(ask "选择 [1-3] (默认 1): ")" c
+        case ${c:-1} in
+            1) manage_menu; exit 0;;
+            2) ;;
+            3) systemctl stop xray 2>/dev/null || true; rm -f "$XRAY_CONFIG" "$NODE_INFO";;
+            *) manage_menu; exit 0;;
         esac
-        echo -e "  当前节点: ${GREEN}$type_display${NC}  ${CYAN}$(get_ip):${port:-?}${NC}"
-        manage_menu
-        exit 0
     fi
 
     echo ""
-    echo "  1. VLESS + REALITY    (推荐 - 直接过墙, 伪装流量)"
-    echo "  2. VLESS + Encryption (PR #5067 - 后量子加密, CDN/中转)"
-    echo "  3. VLESS 基础版       (明文, 不推荐)"
-    echo "  4. 节点管理"
-    echo "  5. 退出"
+    echo "  1. VLESS + REALITY    (推荐 - 伪装 HTTPS)"
+    echo "  2. VLESS + Encryption (PQ - CDN/中转)"
+    echo "  3. VLESS 基础版       (测试用)"
+    echo "  4. 退出"
     echo ""
-    read -rp "$(ask "请选择 [1-5]: ")" choice
-
-    case $choice in
-        1) config_type="reality" ;;
-        2) config_type="encryption" ;;
-        3) config_type="basic" ;;
-        4) if is_installed; then manage_menu; exit 0; else warn "未检测到已安装节点，请先安装"; exit 1; fi ;;
-        5) echo "退出"; exit 0 ;;
-        *) error "无效选择" ;;
+    read -rp "$(ask "选择 [1-4]: ")" c
+    case $c in
+        1) config_reality;;
+        2) config_encryption;;
+        3) config_basic;;
+        4) exit 0;;
+        *) error "无效选择";;
     esac
 }
 
-#=============================================================================
-# 入口
-#=============================================================================
 main() {
-    # 检查是否要求进入管理模式
-    if [[ "$1" == "--manage" || "$1" == "-m" ]]; then
-        if ! is_installed; then
-            error "未检测到已安装的节点，请先运行 bash install.sh"
-        fi
-        manage_menu
-        exit 0
-    fi
-
     pre_check
     install_deps
     install_xray
-    setup_dirs
-
-    main_menu
-
-    case $config_type in
-        reality)    config_reality ;;
-        encryption) config_encryption ;;
-        basic)      config_basic ;;
-    esac
-
+    install_geodata
+    install_menu
     setup_firewall
     setup_service
     setup_bbr
-    show_commands
-    summary
+
+    echo ""
+    echo -e "${GREEN}══════════════ 安装完成 ══════════════${NC}"
+    echo -e "  管理: ${CYAN}bash install.sh${NC}"
+    echo -e "  配置: ${CYAN}$XRAY_CONFIG${NC}"
+    echo -e "  链接: ${CYAN}$XRAY_DIR/vless-link.txt${NC}"
 }
 
 main "$@"
