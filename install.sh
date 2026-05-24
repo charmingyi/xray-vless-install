@@ -110,8 +110,13 @@ install_deps() {
     echo -e "${CYAN}直接安装...${NC}"
 
     if [[ "$PKG_MGR" == "apt-get" ]]; then
-        # 不跑 update，直接装。Debian 云镜像通常缓存了 base 包
-        apt-get install -y --no-install-recommends $pkgs_missing 2>&1 | while IFS= read -r line; do
+        # 移走镜像配置文件，避免 mirror+file 卡死
+        mkdir -p /tmp/apt-mirror-backup
+        mv /etc/apt/mirrors/* /tmp/apt-mirror-backup/ 2>/dev/null || true
+        mv /etc/apt/sources.list.d/*mirror* /tmp/apt-mirror-backup/ 2>/dev/null || true
+
+        # 不跑 update，直接装，加 30s 超时防止卡死
+        timeout 30 apt-get install -y --no-install-recommends $pkgs_missing 2>&1 | while IFS= read -r line; do
             if [[ "$line" =~ (Setting\ up|Unpacking|Installing|Selecting|Get:) ]]; then
                 echo -e "  ${GREEN}▸${NC} $line"
             fi
@@ -890,9 +895,8 @@ main_menu() {
     echo "╚══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
-    # 检查是否已安装
+    # 检查是否已安装 → 直接进管理，不啰嗦
     if is_installed; then
-        echo -e "${YELLOW}  检测到已安装的节点!${NC}"
         load_node_info
         local port=$(grep -oP '(?<="port": )\d+' "$XRAY_CONFIG" | head -1)
         local type_display="未知"
@@ -901,21 +905,9 @@ main_menu() {
             encryption) type_display="VLESS + Encryption" ;;
             basic) type_display="VLESS 基础版" ;;
         esac
-        echo -e "  当前方案: ${GREEN}$type_display${NC}  端口: ${CYAN}${port:-?}${NC}"
-        echo ""
-        echo "  1. 管理已有节点"
-        echo "  2. 重新安装 (覆盖当前配置)"
-        echo "  3. 退出"
-        echo ""
-        read -rp "$(ask "请选择 [1-3]: ")" choice
-        case $choice in
-            1) manage_menu; exit 0 ;;
-            2) info "将覆盖现有配置，重新安装..."
-               systemctl stop xray 2>/dev/null || true
-               ;;
-            3) exit 0 ;;
-            *) error "无效选择" ;;
-        esac
+        echo -e "  当前节点: ${GREEN}$type_display${NC}  ${CYAN}$(get_ip):${port:-?}${NC}"
+        manage_menu
+        exit 0
     fi
 
     echo ""
