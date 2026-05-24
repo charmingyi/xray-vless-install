@@ -440,23 +440,53 @@ METAEOF
 
     SERVER_IP=$(get_ip)
 
+    # 生成客户端 JSON（decryption 在 settings 级，不在 users 里）
+    CLIENT_JSON=$(cat << CLIENTEOF
+{
+  "outbounds": [
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "$SERVER_IP",
+            "port": $PORT,
+            "users": [
+              {
+                "id": "$UUID",
+                "encryption": "none"
+              }
+            ]
+          }
+        ],
+        "decryption": "$DECRYPTION"
+      },
+      "streamSettings": {
+        "network": "raw"
+      }
+    }
+  ]
+}
+CLIENTEOF
+)
+    echo "$CLIENT_JSON" > "$XRAY_DIR/client-config.json"
+
     echo ""
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
     echo -e "${BOLD}${GREEN}  VLESS + Encryption 服务端配置完成!${NC}"
     echo -e "${BOLD}${GREEN}═══════════════════════════════════════════════════════════${NC}"
     echo ""
-    echo -e "  协议:       ${YELLOW}VLESS + Encryption (PR #5067)${NC}"
     echo -e "  地址:       ${CYAN}$SERVER_IP${NC}"
     echo -e "  端口:       ${CYAN}$PORT${NC}"
     echo -e "  UUID:       ${CYAN}$UUID${NC}"
     echo -e "  加密模式:   ${CYAN}$ENC_MODE${NC}"
     echo -e "  Ticket:     ${CYAN}$ticket_time${NC}"
     echo ""
-    echo -e "${BOLD}VLESS 分享链接:${NC}"
-    echo -e "${GREEN}vless://${UUID}@${SERVER_IP}:${PORT}?encryption=none&type=raw#VLESS-Enc-${ENC_MODE}-$(hostname 2>/dev/null || echo 'VPS')${NC}"
+    echo -e "${BOLD}客户端配置已保存到:${NC}"
+    echo -e "  ${GREEN}$XRAY_DIR/client-config.json${NC}"
     echo ""
-    echo -e "  ${YELLOW}⚠ 客户端需在 outbound settings 中配置 decryption 字段:${NC}"
-    echo -e "  ${YELLOW}   ${DECRYPTION:0:70}...${NC}"
+    echo -e "${BOLD}客户端 JSON (复制到 v2rayN/NekoBox 出站设置):${NC}"
+    echo -e "${GREEN}$CLIENT_JSON${NC}"
     echo ""
     echo -e "${YELLOW}⚠ VLESS Encryption 适合 CDN / 中转 / non-TLS${NC}"
     echo -e "${YELLOW}  直接过墙请用 VLESS + REALITY 方案${NC}"
