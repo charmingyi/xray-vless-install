@@ -320,19 +320,6 @@ config_encryption() {
     dec="${dec/.native./.random.}"
     enc="${enc/.native./.random.}"
 
-    # vlessenc 的 encryption 字段是短种子（~43 char），客户端需要完整 ML-KEM-768 公钥（~1579 char）
-    # enc 保留短密钥用于服务端 config；enc_link 取长公钥用于分享链接
-    local enc_link="$enc"
-    local mlkem_out client_long
-    mlkem_out=$("$XRAY_BIN" mlkem768 2>/dev/null || true)
-    client_long=$(echo "$mlkem_out" | grep -oP 'Client:\s*\K\S+')
-    if [[ -n "$client_long" ]]; then
-        enc_link="${enc%.*}.${client_long}"
-        info "已获取 ML-KEM-768 完整公钥 (${#client_long} chars) 用于分享链接"
-    else
-        warn "mlkem768 命令不可用，分享链接将使用短种子（可能不被客户端识别）"
-    fi
-
     local ip; ip=$(get_ip)
 
     # 追加 inbounds 配置（兼容已有节点）
@@ -358,18 +345,18 @@ config_encryption() {
     echo "$cfg" | jq --argjson new "$new_inbound" \
         'if .inbounds == null then .inbounds = [] else . end | .inbounds += [$new]' > "$XRAY_CONFIG"
 
-    # 元信息（enc_link 存长公钥用于分享）
+    # 元信息
     jq -n --arg type "encryption" --argjson port "$port" --arg uuid "$uuid" \
-          --arg enc "$enc" --arg enc_link "$enc_link" --arg dec "$dec" --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+          --arg enc "$enc" --arg dec "$dec" --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
     '{
       type: $type, port: $port, uuid: $uuid,
-      encryption: $enc_link, decryption: $dec,
+      encryption: $enc, decryption: $dec,
       ip: $ip, time: $time
     }' > "$NODE_INFO"
 
-    # 分享链接（用长公钥 enc_link）
+    # 分享链接
     local disp=$ip; [[ "$ip" =~ ":" ]] && disp="[$ip]"
-    local link="vless://${uuid}@${disp}:${port}?encryption=${enc_link}&type=tcp&security=none#VLESS-PQ-${port}"
+    local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&type=tcp&security=none#VLESS-PQ-${port}"
     echo "$link" > "$XRAY_DIR/vless-link.txt"
 
     echo ""
