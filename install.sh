@@ -525,8 +525,8 @@ install_menu() {
     clear
     echo -e "${BOLD}${CYAN}"
     echo "╔══════════════════════════════════════════════════════╗"
-    echo "║     Xray VLESS 一键安装 & 管理脚本                  ║"
-    echo "║     REALITY | Encryption(PR#5067) | 基础版          ║"
+    echo "║     Xray VLESS 一键安装 & 管理                      ║"
+    echo "║     REALITY | Encryption | 基础版                   ║"
     echo "╚══════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -534,39 +534,56 @@ install_menu() {
         local info; info=$(load_node_json)
         local t; t=$(echo "$info" | jq -r '.type//"?"')
         local p; p=$(echo "$info" | jq -r '.port//"?"')
-        echo -e "  已安装: ${GREEN}$t${NC}  端口: ${CYAN}$p${NC}"
+        echo -e "  节点: ${GREEN}$t${NC}  端口: ${CYAN}$p${NC}"
         echo ""
-        echo "  1. 进入管理面板"
-        echo "  2. 新增节点 (追加配置)"
-        echo "  3. 重装 (覆盖)"
+        echo "  1. 管理面板       3. 新增节点"
+        echo "  2. 查看分享链接   0. 退出"
         echo ""
-        read -rp "$(ask "选择 [1-3] (默认 1): ")" c
+        read -rp "$(ask "选择 [0-3] (默认 1): ")" c
         case ${c:-1} in
             1) manage_menu; exit 0;;
-            2) ;;
-            3) systemctl stop xray 2>/dev/null || true; rm -f "$XRAY_CONFIG" "$NODE_INFO";;
+            2) view_config; exit 0;;
+            3)
+                # 新增节点：选协议 → 写配置 → 重启
+                choose_protocol
+                setup_firewall
+                if [[ "$INIT_SYSTEM" == "systemd" ]]; then systemctl restart xray; else rc-service xray restart; fi
+                info "新节点已生效"
+                exit 0
+                ;;
+            0) exit 0;;
             *) manage_menu; exit 0;;
         esac
     fi
 
+    choose_protocol
+}
+
+choose_protocol() {
     echo ""
-    echo "  1. VLESS + REALITY    (推荐 - 伪装 HTTPS)"
+    echo "  1. VLESS + REALITY    (伪装 HTTPS)"
     echo "  2. VLESS + Encryption (PQ - CDN/中转)"
-    echo "  3. VLESS 基础版       (测试用)"
-    echo "  4. 退出"
+    echo "  3. VLESS 基础版"
     echo ""
-    read -rp "$(ask "选择 [1-4]: ")" c
+    read -rp "$(ask "选择 [1-3]: ")" c
     case $c in
         1) config_reality;;
         2) config_encryption;;
         3) config_basic;;
-        4) exit 0;;
         *) error "无效选择";;
     esac
 }
 
 main() {
     pre_check
+
+    # 已安装 → 直接进菜单，不碰任何服务
+    if [[ -f "$XRAY_BIN" && -f "$XRAY_CONFIG" ]]; then
+        install_menu
+        exit 0
+    fi
+
+    # 首次安装
     install_deps
     install_xray
     install_geodata
@@ -577,9 +594,8 @@ main() {
 
     echo ""
     echo -e "${GREEN}══════════════ 安装完成 ══════════════${NC}"
-    echo -e "  管理: ${CYAN}bash install.sh${NC}"
+    echo -e "  管理: ${CYAN}curl ... | bash${NC}"
     echo -e "  配置: ${CYAN}$XRAY_CONFIG${NC}"
-    echo -e "  链接: ${CYAN}$XRAY_DIR/vless-link.txt${NC}"
 }
 
 main "$@"
