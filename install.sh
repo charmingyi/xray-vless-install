@@ -82,101 +82,58 @@ pre_check() {
 }
 
 #=============================================================================
-# 安装依赖（显示实时进度，IPv4 强制，镜像故障自动回退）
+# 安装依赖（逐个检查，缺啥装啥，不折腾源）
 #=============================================================================
 install_deps() {
     step "安装基础依赖"
 
-    # --- apt 专用：强制 IPv4 + 修复 DNS 问题 ---
+    local pkgs_missing=""
+
+    # 检查每个必要的命令，只装缺的
+    for cmd in curl wget unzip socat python3; do
+        if ! command -v "$cmd" &>/dev/null; then
+            pkgs_missing="$pkgs_missing $cmd"
+        fi
+    done
+
+    # ca-certificates 处理（不是命令，是包）
+    if [[ ! -f /etc/ssl/certs/ca-certificates.crt ]]; then
+        pkgs_missing="$pkgs_missing ca-certificates"
+    fi
+
+    if [[ -z "$pkgs_missing" ]]; then
+        info "所有依赖已就绪，跳过安装"
+        return
+    fi
+
+    info "缺少:${pkgs_missing}"
+    echo -e "${CYAN}直接安装...${NC}"
+
     if [[ "$PKG_MGR" == "apt-get" ]]; then
-        # 写 apt 配置文件强制 IPv4（比 -o 参数更可靠，对所有源生效）
-        mkdir -p /etc/apt/apt.conf.d
-        cat > /etc/apt/apt.conf.d/99-xray-install << 'APTEOF'
-Acquire::ForceIPv4 "true";
-Acquire::http::Timeout "10";
-Acquire::https::Timeout "10";
-Acquire::Retries "3";
-APTEOF
-        info "已配置 apt 强制 IPv4"
-
-        # 检测当前镜像源是否可达（中国 VPS 常见：清华/阿里/中科大）
-        echo -e "${CYAN}检测镜像源连通性...${NC}"
-        local mirrors_ok=true
-        if ! timeout 5 curl -sI https://mirrors.tuna.tsinghua.edu.cn/ >/dev/null 2>&1 && \
-           ! timeout 5 curl -sI http://mirrors.tuna.tsinghua.edu.cn/ >/dev/null 2>&1; then
-            mirrors_ok=false
-        fi
-
-        # 如果默认镜像不通，切换为 Debian 官方 CDN（自动路由到最近节点）
-        if ! $mirrors_ok; then
-            warn "当前镜像源不可达，切换为 Debian 官方源"
-            local codename=$(grep VERSION_CODENAME /etc/os-release 2>/dev/null | cut -d= -f2)
-            [[ -z "$codename" ]] && codename="bookworm"
-            cat > /etc/apt/sources.list << SRCEOF
-deb http://deb.debian.org/debian ${codename} main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian ${codename}-updates main contrib non-free non-free-firmware
-deb http://deb.debian.org/debian-security ${codename}-security main contrib non-free non-free-firmware
-SRCEOF
-            # 如果存在 mirror 配置也清掉避免干扰
-            rm -f /etc/apt/mirrors/debian.list /etc/apt/mirrors/debian-security.list 2>/dev/null
-            info "已切换为: http://deb.debian.org/debian"
-        fi
-
-        # 执行 apt update，捕获错误但不退出
-        echo -e "${CYAN}正在更新软件源...${NC}"
-        local update_failed=false
-        $PKG_UPDATE 2>&1 | while IFS= read -r line; do
-            if [[ "$line" == *"Get:"* || "$line" == *"Hit:"* || "$line" == *"Fetched"* || "$line" == *"Reading"* || "$line" == *"Building"* ]]; then
-                echo -e "  ${GREEN}▸${NC} $line"
-            elif [[ "$line" == *"Err:"* || "$line" == *"Failed"* || "$line" == *"Unable to connect"* ]]; then
-                echo -e "  ${RED}✗${NC} $line"
-            elif [[ "$line" == *"W:"* ]]; then
-                echo -e "  ${YELLOW}⚠${NC} $line"
-            fi
-        done
-        local ret=${PIPESTATUS[0]}
-        if [[ $ret -ne 0 ]]; then
-            warn "apt update 返回错误码 $ret，尝试继续..."
-        fi
-
-        # 安装包
-        echo -e "${CYAN}正在安装依赖包 (curl wget unzip socat ca-certificates)...${NC}"
-        $PKG_INSTALL curl wget unzip socat ca-certificates 2>&1 | while IFS= read -r line; do
+        # 不跑 update，直接装。Debian 云镜像通常缓存了 base 包
+        apt-get install -y --no-install-recommends $pkgs_missing 2>&1 | while IFS= read -r line; do
             if [[ "$line" =~ (Setting\ up|Unpacking|Installing|Selecting|Get:) ]]; then
                 echo -e "  ${GREEN}▸${NC} $line"
-            elif [[ "$line" == *"Err:"* || "$line" == *"Failed"* ]]; then
-                echo -e "  ${RED}✗${NC} $line"
             fi
         done
-        if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
-            warn "部分依赖包安装失败，尝试继续..."
-        fi
-
-    # --- yum/dnf ---
     else
-        echo -e "${CYAN}正在更新软件源...${NC}"
-        $PKG_UPDATE 2>&1 | while IFS= read -r line; do
-            if [[ "$line" =~ (Downloading|Installing|Updating|Metadata) ]]; then
-                echo -e "  ${GREEN}▸${NC} $line"
-            fi
-        done
-
-        echo -e "${CYAN}正在安装依赖包...${NC}"
-        $PKG_INSTALL curl wget unzip socat ca-certificates 2>&1 | while IFS= read -r line; do
+        $PKG_INSTALL $pkgs_missing 2>&1 | while IFS= read -r line; do
             if [[ "$line" =~ (Installing|Downloading) ]]; then
                 echo -e "  ${GREEN}▸${NC} $line"
             fi
         done
     fi
 
-    # 确保 python3 可用于 JSON 解析（jq 的降级方案）
-    if ! command -v python3 &>/dev/null; then
-        echo -e "${CYAN}安装 python3...${NC}"
-        if [[ "$PKG_MGR" == "apt-get" ]]; then
-            apt-get install -y python3 2>/dev/null || true
-        else
-            $PKG_INSTALL python3 2>/dev/null || true
-        fi
+    # 二次确认
+    local still_missing=""
+    for cmd in curl wget unzip socat python3; do
+        command -v "$cmd" &>/dev/null || still_missing="$still_missing $cmd"
+    done
+    if [[ -n "$still_missing" ]]; then
+        warn "以下依赖仍未安装:${still_missing}"
+        warn "可能是源不可达。尝试强制更新源后重试..."
+        apt-get update -o Acquire::ForceIPv4=true 2>/dev/null || true
+        apt-get install -y --no-install-recommends $still_missing 2>/dev/null || true
     fi
 
     info "依赖安装完成"
