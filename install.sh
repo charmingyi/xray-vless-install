@@ -4,7 +4,7 @@
 # 支持: VLESS + REALITY | VLESS + Encryption (PR #5067) | VLESS 基础版
 # Author: JJQQA / David Tao
 # License: MIT
-# Repo: https://github.com/jjqqa/xray-vless-install
+# Repo: https://github.com/charmingyi/xray-vless-install
 #=============================================================================
 
 set -eo pipefail

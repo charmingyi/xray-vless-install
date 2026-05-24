@@ -14,13 +14,13 @@
 ## 快速开始
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/jjqqa/xray-vless-install/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/charmingyi/xray-vless-install/main/install.sh)
 ```
 
 或手动：
 
 ```bash
-wget https://raw.githubusercontent.com/jjqqa/xray-vless-install/main/install.sh
+wget https://raw.githubusercontent.com/charmingyi/xray-vless-install/main/install.sh
 chmod +x install.sh
 sudo bash install.sh
 ```
