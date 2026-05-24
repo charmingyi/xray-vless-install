@@ -66,20 +66,14 @@ pre_check() {
         PKG_MGR="apt-get"
         PKG_UPDATE="apt-get update"
         PKG_INSTALL="apt-get install -y"
-        # 强制 IPv4，修复 VPS 无 IPv6 导致的连接超时
-        APT_OPTS="-o Acquire::ForceIPv4=true -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10"
-        PKG_UPDATE="$PKG_UPDATE $APT_OPTS"
-        PKG_INSTALL="$PKG_INSTALL $APT_OPTS"
     elif command -v yum &>/dev/null; then
         PKG_MGR="yum"
         PKG_UPDATE="yum makecache"
         PKG_INSTALL="yum install -y"
-        APT_OPTS=""
     elif command -v dnf &>/dev/null; then
         PKG_MGR="dnf"
         PKG_UPDATE="dnf makecache"
         PKG_INSTALL="dnf install -y"
-        APT_OPTS=""
     else
         error "未检测到 apt-get / yum / dnf，不支持此系统"
     fi
@@ -88,31 +82,101 @@ pre_check() {
 }
 
 #=============================================================================
-# 安装依赖（显示实时进度）
+# 安装依赖（显示实时进度，IPv4 强制，镜像故障自动回退）
 #=============================================================================
 install_deps() {
     step "安装基础依赖"
 
-    echo -e "${CYAN}正在更新软件源...${NC}"
-    $PKG_UPDATE 2>&1 | while IFS= read -r line; do
-        if [[ "$line" == *"Get:"* || "$line" == *"Hit:"* || "$line" == *"Fetched"* || "$line" == *"Reading"* || "$line" == *"Building"* ]]; then
-            echo -e "  ${GREEN}▸${NC} $line"
-        elif [[ "$line" == *"Err:"* || "$line" == *"Failed"* ]]; then
-            echo -e "  ${RED}✗${NC} $line"
-        fi
-    done
+    # --- apt 专用：强制 IPv4 + 修复 DNS 问题 ---
+    if [[ "$PKG_MGR" == "apt-get" ]]; then
+        # 写 apt 配置文件强制 IPv4（比 -o 参数更可靠，对所有源生效）
+        mkdir -p /etc/apt/apt.conf.d
+        cat > /etc/apt/apt.conf.d/99-xray-install << 'APTEOF'
+Acquire::ForceIPv4 "true";
+Acquire::http::Timeout "10";
+Acquire::https::Timeout "10";
+Acquire::Retries "3";
+APTEOF
+        info "已配置 apt 强制 IPv4"
 
-    echo -e "${CYAN}正在安装依赖包 (curl wget unzip socat ca-certificates)...${NC}"
-    $PKG_INSTALL curl wget unzip socat ca-certificates 2>&1 | while IFS= read -r line; do
-        if [[ "$line" =~ (Setting\ up|Unpacking|Installing|Selecting) ]]; then
-            echo -e "  ${GREEN}▸${NC} $line"
+        # 检测当前镜像源是否可达（中国 VPS 常见：清华/阿里/中科大）
+        echo -e "${CYAN}检测镜像源连通性...${NC}"
+        local mirrors_ok=true
+        if ! timeout 5 curl -sI https://mirrors.tuna.tsinghua.edu.cn/ >/dev/null 2>&1 && \
+           ! timeout 5 curl -sI http://mirrors.tuna.tsinghua.edu.cn/ >/dev/null 2>&1; then
+            mirrors_ok=false
         fi
-    done
 
-    # 安装 jq 或确保 python3 可用
-    if ! command -v jq &>/dev/null && ! command -v python3 &>/dev/null; then
-        echo -e "${CYAN}安装 python3 用于 JSON 解析...${NC}"
-        $PKG_INSTALL python3 2>/dev/null || true
+        # 如果默认镜像不通，切换为 Debian 官方 CDN（自动路由到最近节点）
+        if ! $mirrors_ok; then
+            warn "当前镜像源不可达，切换为 Debian 官方源"
+            local codename=$(grep VERSION_CODENAME /etc/os-release 2>/dev/null | cut -d= -f2)
+            [[ -z "$codename" ]] && codename="bookworm"
+            cat > /etc/apt/sources.list << SRCEOF
+deb http://deb.debian.org/debian ${codename} main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian ${codename}-updates main contrib non-free non-free-firmware
+deb http://deb.debian.org/debian-security ${codename}-security main contrib non-free non-free-firmware
+SRCEOF
+            # 如果存在 mirror 配置也清掉避免干扰
+            rm -f /etc/apt/mirrors/debian.list /etc/apt/mirrors/debian-security.list 2>/dev/null
+            info "已切换为: http://deb.debian.org/debian"
+        fi
+
+        # 执行 apt update，捕获错误但不退出
+        echo -e "${CYAN}正在更新软件源...${NC}"
+        local update_failed=false
+        $PKG_UPDATE 2>&1 | while IFS= read -r line; do
+            if [[ "$line" == *"Get:"* || "$line" == *"Hit:"* || "$line" == *"Fetched"* || "$line" == *"Reading"* || "$line" == *"Building"* ]]; then
+                echo -e "  ${GREEN}▸${NC} $line"
+            elif [[ "$line" == *"Err:"* || "$line" == *"Failed"* || "$line" == *"Unable to connect"* ]]; then
+                echo -e "  ${RED}✗${NC} $line"
+            elif [[ "$line" == *"W:"* ]]; then
+                echo -e "  ${YELLOW}⚠${NC} $line"
+            fi
+        done
+        local ret=${PIPESTATUS[0]}
+        if [[ $ret -ne 0 ]]; then
+            warn "apt update 返回错误码 $ret，尝试继续..."
+        fi
+
+        # 安装包
+        echo -e "${CYAN}正在安装依赖包 (curl wget unzip socat ca-certificates)...${NC}"
+        $PKG_INSTALL curl wget unzip socat ca-certificates 2>&1 | while IFS= read -r line; do
+            if [[ "$line" =~ (Setting\ up|Unpacking|Installing|Selecting|Get:) ]]; then
+                echo -e "  ${GREEN}▸${NC} $line"
+            elif [[ "$line" == *"Err:"* || "$line" == *"Failed"* ]]; then
+                echo -e "  ${RED}✗${NC} $line"
+            fi
+        done
+        if [[ ${PIPESTATUS[0]} -ne 0 ]]; then
+            warn "部分依赖包安装失败，尝试继续..."
+        fi
+
+    # --- yum/dnf ---
+    else
+        echo -e "${CYAN}正在更新软件源...${NC}"
+        $PKG_UPDATE 2>&1 | while IFS= read -r line; do
+            if [[ "$line" =~ (Downloading|Installing|Updating|Metadata) ]]; then
+                echo -e "  ${GREEN}▸${NC} $line"
+            fi
+        done
+
+        echo -e "${CYAN}正在安装依赖包...${NC}"
+        $PKG_INSTALL curl wget unzip socat ca-certificates 2>&1 | while IFS= read -r line; do
+            if [[ "$line" =~ (Installing|Downloading) ]]; then
+                echo -e "  ${GREEN}▸${NC} $line"
+            fi
+        done
+    fi
+
+    # 确保 python3 可用于 JSON 解析（jq 的降级方案）
+    if ! command -v python3 &>/dev/null; then
+        echo -e "${CYAN}安装 python3...${NC}"
+        if [[ "$PKG_MGR" == "apt-get" ]]; then
+            apt-get install -y python3 2>/dev/null || true
+        else
+            $PKG_INSTALL python3 2>/dev/null || true
+        fi
     fi
 
     info "依赖安装完成"
