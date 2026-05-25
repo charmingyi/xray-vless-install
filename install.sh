@@ -210,9 +210,10 @@ command="/usr/local/bin/xray"
 command_args="run -config /usr/local/etc/xray/config.json"
 command_background=true
 pidfile="/run/xray.pid"
-start_stop_daemon_args="--make-pidfile --background"
+start_stop_daemon_args="--make-pidfile --background --stdout /var/log/xray/xray.log --stderr /var/log/xray/xray.log"
 depend() { need net; use dns; }
 IEOF
+        mkdir -p /var/log/xray
         chmod +x /etc/init.d/xray; rc-update add xray default; rc-service xray restart || rc-service xray start
     fi
     sleep 2
