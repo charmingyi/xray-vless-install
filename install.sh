@@ -76,6 +76,10 @@ pre_check() {
     local m=$(uname -m)
     [[ "$m" != "x86_64" && "$m" != "aarch64" && "$m" != "amd64" ]] && error "仅支持 x86_64 / arm64"
     detect_system
+    # Alpine: BusyBox grep 不支持 -P，装 GNU grep
+    if ! echo | grep -oP '.' &>/dev/null && command -v apk &>/dev/null; then
+        apk add --no-cache grep 2>/dev/null || true
+    fi
     info "系统: ${PRETTY_NAME:-$OS_ID} | 架构: $(uname -m) | 服务: $INIT_SYSTEM"
 }
 
@@ -87,7 +91,7 @@ install_deps() {
 
     # ---- Alpine ----
     if command -v apk &>/dev/null; then
-        apk add --no-cache curl wget unzip jq openssl 2>/dev/null || true
+        apk add --no-cache curl wget unzip jq openssl grep 2>/dev/null || true
         for c in curl wget unzip jq openssl; do
             command -v "$c" &>/dev/null || error "无法安装 $c"
         done
