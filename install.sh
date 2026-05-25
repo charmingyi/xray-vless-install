@@ -80,10 +80,22 @@ pre_check() {
 }
 
 #=============================================================================
-# 依赖安装（缺啥直接 curl .deb，不碰 apt 源）
+# 依赖安装 (Debian: .deb 直下 / Alpine: apk)
 #=============================================================================
 install_deps() {
     step "安装基础依赖"
+
+    # ---- Alpine ----
+    if command -v apk &>/dev/null; then
+        apk add --no-cache curl wget unzip jq openssl 2>/dev/null || true
+        for c in curl wget unzip jq openssl; do
+            command -v "$c" &>/dev/null || error "无法安装 $c"
+        done
+        success "依赖就绪 (apk)"
+        return
+    fi
+
+    # ---- Debian/Ubuntu ----
     local missing=""
     for c in curl wget unzip jq libjq1 openssl; do
         command -v "$c" &>/dev/null || missing="$missing $c"
@@ -523,6 +535,9 @@ setup_firewall() {
             ufw allow "$p"/tcp 2>/dev/null || true
         elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
             firewall-cmd --permanent --add-port="$p"/tcp 2>/dev/null || true
+        elif command -v iptables &>/dev/null; then
+            iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || \
+                iptables -I INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || true
         fi
     done
     command -v firewall-cmd &>/dev/null && firewall-cmd --reload 2>/dev/null || true
@@ -531,6 +546,8 @@ setup_firewall() {
 }
 
 setup_bbr() {
+    # Alpine: 跳过（内核通常不含 BBR 模块）
+    command -v apk &>/dev/null && { warn "Alpine 跳过 BBR"; return; }
     lsmod | grep -q tcp_bbr && return
     modprobe tcp_bbr 2>/dev/null || true
     echo "tcp_bbr" >> /etc/modules-load.d/modules.conf 2>/dev/null || true
@@ -621,7 +638,10 @@ SCRIPT_VER="2.0.0"
 show_header() {
     clear
     local xver; xver=$("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}' || echo "未安装")
-    local svc="未运行"; if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl is-active --quiet xray 2>/dev/null; then svc="运行中"; fi
+    local svc="未运行"
+    if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl is-active --quiet xray 2>/dev/null; then svc="运行中"
+    elif [[ "$INIT_SYSTEM" == "openrc" ]] && rc-service xray status 2>/dev/null | grep -qi started; then svc="运行中"
+    fi
 
     echo -e "${BOLD}${CYAN}"
     echo "=============================================================="
