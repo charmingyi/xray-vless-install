@@ -25,7 +25,11 @@ extract_after_colon() { awk -F': *' -v k="$1" '$1==k {print $2; exit}'; }
 extract_xray_key() {
     local want="$1"
     awk -F': *' -v want="$want" '
-        { key=tolower($1); gsub(/[[:space:]_-]/, "", key) }
+        {
+            key=tolower($1)
+            gsub(/\([^)]*\)/, "", key)
+            gsub(/[[:space:]_-]/, "", key)
+        }
         want=="private" && (key=="privatekey" || key=="private") { print $2; exit }
         want=="public" && (key=="publickey" || key=="public" || key=="password") { print $2; exit }
     '
