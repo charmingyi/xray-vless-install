@@ -1,7 +1,7 @@
 # Xray VLESS 一键安装 & 管理
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/charmingyi/xray-vless-install/1a2eed953c613bf31c3194fb1bb8170e8d2f41f3/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/charmingyi/xray-vless-install/27d87bea2e63b3ba47134fc4e4d6270cb4009047/install.sh)
 ```
 
 ## 方案
