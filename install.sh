@@ -22,6 +22,14 @@ ask()     { echo -ne "${CYAN}[?]${NC} $* "; }
 # BusyBox/Alpine 兼容：不要依赖 GNU grep -P
 kv_get() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$2" 2>/dev/null || true; }
 extract_after_colon() { awk -F': *' -v k="$1" '$1==k {print $2; exit}'; }
+extract_xray_key() {
+    local want="$1"
+    awk -F': *' -v want="$want" '
+        { key=tolower($1); gsub(/[[:space:]_-]/, "", key) }
+        want=="private" && (key=="privatekey" || key=="private") { print $2; exit }
+        want=="public" && (key=="publickey" || key=="public" || key=="password") { print $2; exit }
+    '
+}
 extract_json_string_last() {
     local key="$1"
     awk -v key="$key" '{
@@ -244,9 +252,9 @@ config_reality() {
     [[ "$port" != "443" ]] && warn "REALITY 正在使用非 443 端口；NAT 小鸡可用，但客户端必须填写 NAT 外部映射端口，云面板也必须放行该 TCP 端口"
 
     local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
-    local pk; pk=$(echo "$keys" | extract_after_colon "PrivateKey")
-    local pbk; pbk=$(echo "$keys" | extract_after_colon "Password")
-    [[ -z "$pk" ]] && error "密钥生成失败"
+    local pk; pk=$(echo "$keys" | extract_xray_key "private")
+    local pbk; pbk=$(echo "$keys" | extract_xray_key "public")
+    [[ -z "$pk" || -z "$pbk" ]] && error "REALITY 密钥生成失败"
 
     local uuid; uuid=$("$XRAY_BIN" uuid 2>/dev/null)
     local sid; sid=$(random_hex 8); local sid2; sid2=$(random_hex 8)
@@ -411,9 +419,9 @@ config_reality_encryption() {
 
     # REALITY 密钥对
     local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
-    local pk; pk=$(echo "$keys" | extract_after_colon "PrivateKey")
-    local pbk; pbk=$(echo "$keys" | extract_after_colon "Password")
-    [[ -z "$pk" ]] && error "REALITY 密钥生成失败"
+    local pk; pk=$(echo "$keys" | extract_xray_key "private")
+    local pbk; pbk=$(echo "$keys" | extract_xray_key "public")
+    [[ -z "$pk" || -z "$pbk" ]] && error "REALITY 密钥生成失败"
 
     # VLESS Encryption 密钥对 (ML-KEM-768)
     local out dec enc
@@ -777,9 +785,9 @@ regen_reality_keys() {
     [[ ! $c =~ ^[yY]$ ]] && return
 
     local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
-    local new_pk; new_pk=$(echo "$keys" | extract_after_colon "PrivateKey")
-    local new_pbk; new_pbk=$(echo "$keys" | extract_after_colon "Password")
-    [[ -z "$new_pk" ]] && { error "密钥生成失败"; return; }
+    local new_pk; new_pk=$(echo "$keys" | extract_xray_key "private")
+    local new_pbk; new_pbk=$(echo "$keys" | extract_xray_key "public")
+    [[ -z "$new_pk" || -z "$new_pbk" ]] && { error "密钥生成失败"; return; }
 
     cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
     jq --arg pk "$new_pk" --arg pbk "$new_pbk" \
