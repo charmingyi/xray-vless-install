@@ -19,6 +19,21 @@ step()    { echo -e "\n${BOLD}==>${NC}${BOLD} $*${NC}"; }
 success() { echo -e "${GREEN}[OK]${NC}  $*"; }
 ask()     { echo -ne "${CYAN}[?]${NC} $* "; }
 
+# BusyBox/Alpine 兼容：不要依赖 GNU grep -P
+kv_get() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/, ""); print; exit}' "$2" 2>/dev/null || true; }
+extract_after_colon() { awk -F': *' -v k="$1" '$1==k {print $2; exit}'; }
+extract_json_string_last() {
+    local key="$1"
+    awk -v key="$key" '{
+        pattern="\\\"" key "\\\"[[:space:]]*:[[:space:]]*\\\""
+        if (match($0, pattern)) {
+            s=substr($0, RSTART+RLENGTH)
+            sub(/".*/, "", s)
+            v=s
+        }
+    } END { if (v != "") print v }'
+}
+
 # --- 路径 ---
 readonly XRAY_DIR="/usr/local/etc/xray"
 readonly XRAY_BIN="/usr/local/bin/xray"
@@ -33,13 +48,13 @@ load_node_json() {
         cat "$NODE_INFO"
     else
         # 旧格式: TYPE=reality PORT=443 UUID=xxx ...
-        local t=$(grep -oP '^TYPE=\K.*' "$NODE_INFO" 2>/dev/null || echo "?")
-        local p=$(grep -oP '^PORT=\K.*' "$NODE_INFO" 2>/dev/null || echo "?")
-        local u=$(grep -oP '^UUID=\K.*' "$NODE_INFO" 2>/dev/null || echo "?")
-        local sni=$(grep -oP '^SNI=\K.*' "$NODE_INFO" 2>/dev/null || echo "")
-        local pbk=$(grep -oP '^PUBLIC_KEY=\K.*' "$NODE_INFO" 2>/dev/null || echo "")
-        local sid=$(grep -oP '^SHORT_ID=\K.*' "$NODE_INFO" 2>/dev/null || echo "")
-        local enc=$(grep -oP '^ENC_KEY=\K.*' "$NODE_INFO" 2>/dev/null || echo "")
+        local t=$(kv_get TYPE "$NODE_INFO"); t=${t:-?}
+        local p=$(kv_get PORT "$NODE_INFO"); p=${p:-?}
+        local u=$(kv_get UUID "$NODE_INFO"); u=${u:-?}
+        local sni=$(kv_get SNI "$NODE_INFO")
+        local pbk=$(kv_get PUBLIC_KEY "$NODE_INFO")
+        local sid=$(kv_get SHORT_ID "$NODE_INFO")
+        local enc=$(kv_get ENC_KEY "$NODE_INFO")
         jq -n --arg t "$t" --arg p "$p" --arg u "$u" --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --arg enc "$enc" \
           '{type: $t, port: $p, uuid: $u, sni: $sni, pbk: $pbk, sid: $sid, encryption: $enc}'
     fi
@@ -76,10 +91,7 @@ pre_check() {
     local m=$(uname -m)
     [[ "$m" != "x86_64" && "$m" != "aarch64" && "$m" != "amd64" ]] && error "仅支持 x86_64 / arm64"
     detect_system
-    # Alpine: BusyBox grep 不支持 -P，装 GNU grep
-    if ! echo | grep -oP '.' &>/dev/null && command -v apk &>/dev/null; then
-        apk add --no-cache grep 2>/dev/null || true
-    fi
+    # 解析逻辑已避免 grep -P，兼容 Alpine BusyBox
     info "系统: ${PRETTY_NAME:-$OS_ID} | 架构: $(uname -m) | 服务: $INIT_SYSTEM"
 }
 
@@ -91,7 +103,7 @@ install_deps() {
 
     # ---- Alpine ----
     if command -v apk &>/dev/null; then
-        apk add --no-cache curl wget unzip jq openssl grep 2>/dev/null || true
+        apk add --no-cache curl wget unzip jq openssl 2>/dev/null || true
         for c in curl wget unzip jq openssl; do
             command -v "$c" &>/dev/null || error "无法安装 $c"
         done
@@ -231,8 +243,8 @@ config_reality() {
     is_valid_port "$port" || error "无效端口"
 
     local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
-    local pk; pk=$(echo "$keys" | grep -oP 'PrivateKey:\s*\K\S+')
-    local pbk; pbk=$(echo "$keys" | grep -oP 'Password:\s*\K\S+')
+    local pk; pk=$(echo "$keys" | extract_after_colon "PrivateKey")
+    local pbk; pbk=$(echo "$keys" | extract_after_colon "Password")
     [[ -z "$pk" ]] && error "密钥生成失败"
 
     local uuid; uuid=$("$XRAY_BIN" uuid 2>/dev/null)
@@ -319,16 +331,16 @@ config_encryption() {
 
     # 提取 decryption（服务端用）和 encryption（客户端分享链接用）
     # vlessenc 会输出 X25519 和 ML-KEM-768 两套，取最后一套（后量子）
-    dec=$(echo "$out" | grep -oP '"decryption": "\K[^"]*' | tail -1)
-    enc=$(echo "$out" | grep -oP '"encryption": "\K[^"]*' | tail -1)
+    dec=$(echo "$out" | extract_json_string_last "decryption")
+    enc=$(echo "$out" | extract_json_string_last "encryption")
 
     if [[ -z "$dec" || -z "$enc" ]]; then
         # vlessenc 不可用，用 mlkem768 直出长密钥
         warn "vlessenc 失败，用 mlkem768 直出密钥..."
         local mlkem_out; mlkem_out=$("$XRAY_BIN" mlkem768 2>/dev/null)
         local seed client
-        seed=$(echo "$mlkem_out" | grep -oP 'Seed:\s*\K\S+')
-        client=$(echo "$mlkem_out" | grep -oP 'Client:\s*\K\S+')
+        seed=$(echo "$mlkem_out" | extract_after_colon "Seed")
+        client=$(echo "$mlkem_out" | extract_after_colon "Client")
         [[ -z "$seed" ]] && error "mlkem768 密钥生成失败"
         dec="mlkem768x25519plus.random.600s.100-111-1111.75-0-111.50-0-3333.${seed}"
         enc="mlkem768x25519plus.random.600s.100-111-1111.75-0-111.50-0-3333.${client}"
@@ -398,15 +410,15 @@ config_reality_encryption() {
 
     # REALITY 密钥对
     local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
-    local pk; pk=$(echo "$keys" | grep -oP 'PrivateKey:\s*\K\S+')
-    local pbk; pbk=$(echo "$keys" | grep -oP 'Password:\s*\K\S+')
+    local pk; pk=$(echo "$keys" | extract_after_colon "PrivateKey")
+    local pbk; pbk=$(echo "$keys" | extract_after_colon "Password")
     [[ -z "$pk" ]] && error "REALITY 密钥生成失败"
 
     # VLESS Encryption 密钥对 (ML-KEM-768)
     local out dec enc
     out=$("$XRAY_BIN" vlessenc 2>/dev/null || true)
-    dec=$(echo "$out" | grep -oP '"decryption": "\K[^"]*' | tail -1)
-    enc=$(echo "$out" | grep -oP '"encryption": "\K[^"]*' | tail -1)
+    dec=$(echo "$out" | extract_json_string_last "decryption")
+    enc=$(echo "$out" | extract_json_string_last "encryption")
     [[ -z "$dec" || -z "$enc" ]] && error "vlessenc 密钥生成失败"
     dec="${dec/.native./.random.}"
     enc="${enc/.native./.random.}"
@@ -764,8 +776,8 @@ regen_reality_keys() {
     [[ ! $c =~ ^[yY]$ ]] && return
 
     local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
-    local new_pk; new_pk=$(echo "$keys" | grep -oP 'PrivateKey:\s*\K\S+')
-    local new_pbk; new_pbk=$(echo "$keys" | grep -oP 'Password:\s*\K\S+')
+    local new_pk; new_pk=$(echo "$keys" | extract_after_colon "PrivateKey")
+    local new_pbk; new_pbk=$(echo "$keys" | extract_after_colon "Password")
     [[ -z "$new_pk" ]] && { error "密钥生成失败"; return; }
 
     cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak.$(date +%s)"
