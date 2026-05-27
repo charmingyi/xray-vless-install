@@ -238,9 +238,10 @@ IEOF
 config_reality() {
     step "配置 VLESS + REALITY"
 
-    local port=${1:-443}
+    local port=${1:-$(random_port)}
     read -rp "$(ask "端口 (默认 $port): ")" i; port=${i:-$port}
     is_valid_port "$port" || error "无效端口"
+    [[ "$port" != "443" ]] && warn "REALITY 正在使用非 443 端口；NAT 小鸡可用，但客户端必须填写 NAT 外部映射端口，云面板也必须放行该 TCP 端口"
 
     local keys; keys=$("$XRAY_BIN" x25519 2>/dev/null)
     local pk; pk=$(echo "$keys" | extract_after_colon "PrivateKey")
