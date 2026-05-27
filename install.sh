@@ -238,7 +238,7 @@ IEOF
 config_reality() {
     step "配置 VLESS + REALITY"
 
-    local port=${1:-$(random_port)}
+    local port=${1:-443}
     read -rp "$(ask "端口 (默认 $port): ")" i; port=${i:-$port}
     is_valid_port "$port" || error "无效端口"
 
@@ -278,7 +278,7 @@ config_reality() {
           decryption: "none"
         },
         streamSettings: {
-          network: "raw", security: "reality",
+          network: "tcp", security: "reality",
           realitySettings: {
             show: false, dest: $dest, xver: 0,
             serverNames: [$sni], privateKey: $priv,
@@ -300,7 +300,7 @@ config_reality() {
     }' > "$NODE_INFO"
 
     # 分享链接
-    local link="vless://${uuid}@${ip}:${port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=raw&headerType=none#REALITY-${sni}"
+    local link="vless://${uuid}@${ip}:${port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=tcp&headerType=none#REALITY-${sni}"
     echo "$link" > "$XRAY_DIR/vless-link.txt"
 
     echo ""
@@ -597,7 +597,7 @@ view_config() {
         sid=$(echo "$info" | jq -r '.sid//empty')
         echo -e "  SNI: ${CYAN}$sni${NC}    公钥: ${CYAN}$pbk${NC}"
         echo -e "  ShortId: ${CYAN}$sid${NC}"
-        local link="vless://${uuid}@${ip}:${port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=raw&headerType=none#REALITY-${sni}"
+        local link="vless://${uuid}@${ip}:${port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=tcp&headerType=none#REALITY-${sni}"
         echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
         echo "$link" > "$XRAY_DIR/vless-link.txt"
     elif [[ "$type" == "encryption" ]]; then
