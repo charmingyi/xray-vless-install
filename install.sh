@@ -87,6 +87,23 @@ get_ip() {
     echo "YOUR_IP"
 }
 
+format_host() { local h="$1"; [[ "$h" =~ ":" && ! "$h" =~ ^\[.*\]$ ]] && echo "[$h]" || echo "$h"; }
+
+prompt_public_endpoint() {
+    # NAT 小鸡经常是「本机监听端口 != 商家外部映射端口」。
+    # 这里不改 Xray 监听，只修正客户端分享链接使用的地址/端口。
+    local listen_port="$1" default_host="$2"
+    local host port
+    printf '\n' >&2
+    read -rp "$(ask "客户端连接地址/IP (默认 $default_host): ")" host; host=${host:-$default_host}
+    read -rp "$(ask "客户端连接端口/NAT外部端口 (默认 $listen_port): ")" port; port=${port:-$listen_port}
+    is_valid_port "$port" || error "无效客户端端口"
+    printf '%s\t%s\n' "$host" "$port"
+}
+
+endpoint_host() { echo "$1" | cut -f1; }
+endpoint_port() { echo "$1" | cut -f2; }
+
 #=============================================================================
 # 系统检测
 #=============================================================================
@@ -278,10 +295,15 @@ config_reality() {
     esac
 
     local ip; ip=$(get_ip)
+    local ep; ep=$(prompt_public_endpoint "$port" "$ip")
+    local public_host; public_host=$(endpoint_host "$ep")
+    local public_port; public_port=$(endpoint_port "$ep")
+    local public_disp; public_disp=$(format_host "$public_host")
 
     # 写服务端配置
     jq -n --argjson port "$port" --arg uuid "$uuid" --arg priv "$pk" \
           --arg dest "$dest" --arg sni "$sni" --arg sid "$sid" --arg sid2 "$sid2" --arg ip "$ip" \
+          --arg public_host "$public_host" --argjson public_port "$public_port" \
     '{
       log: { loglevel: "warning", access: "/var/log/xray/access.log", error: "/var/log/xray/error.log" },
       inbounds: [{
@@ -305,20 +327,22 @@ config_reality() {
     # 元信息
     jq -n --arg type "reality" --argjson port "$port" --arg uuid "$uuid" \
           --arg sni "$sni" --arg pbk "$pbk" --arg pk "$pk" --arg sid "$sid" \
-          --arg dest "$dest" --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+          --arg dest "$dest" --arg ip "$ip" --arg public_host "$public_host" --argjson public_port "$public_port" \
+          --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
     '{
       type: $type, port: $port, uuid: $uuid, sni: $sni,
       pbk: $pbk, pk: $pk, sid: $sid, dest: $dest,
-      ip: $ip, time: $time
+      ip: $ip, publicHost: $public_host, publicPort: $public_port, time: $time
     }' > "$NODE_INFO"
 
     # 分享链接
-    local link="vless://${uuid}@${ip}:${port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=tcp&headerType=none#REALITY-${sni}"
+    local link="vless://${uuid}@${public_disp}:${public_port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=tcp&headerType=none#REALITY-${sni}"
     echo "$link" > "$XRAY_DIR/vless-link.txt"
 
     echo ""
     echo -e "${GREEN}════════════════════ VLESS + REALITY ════════════════════${NC}"
-    echo -e "  地址:   ${CYAN}$ip${NC}          端口: ${CYAN}$port${NC}"
+    echo -e "  地址:   ${CYAN}$public_host${NC}          端口: ${CYAN}$public_port${NC}"
+    [[ "$public_host:$public_port" != "$ip:$port" ]] && echo -e "  本机监听: ${CYAN}$ip:$port${NC}  NAT映射: ${CYAN}$public_host:$public_port${NC}"
     echo -e "  UUID:   ${CYAN}$uuid${NC}"
     echo -e "  公钥:   ${CYAN}$pbk${NC}     ShortId: ${CYAN}$sid${NC}"
     echo -e "  伪装:   ${CYAN}$sni${NC}    指纹: chrome"
@@ -364,6 +388,10 @@ config_encryption() {
     enc="${enc/.native./.random.}"
 
     local ip; ip=$(get_ip)
+    local ep; ep=$(prompt_public_endpoint "$port" "$ip")
+    local public_host; public_host=$(endpoint_host "$ep")
+    local public_port; public_port=$(endpoint_port "$ep")
+    local public_disp; public_disp=$(format_host "$public_host")
 
     # 追加 inbounds 配置（兼容已有节点）
     local cfg new_inbound
@@ -390,21 +418,23 @@ config_encryption() {
 
     # 元信息
     jq -n --arg type "encryption" --argjson port "$port" --arg uuid "$uuid" \
-          --arg enc "$enc" --arg dec "$dec" --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+          --arg enc "$enc" --arg dec "$dec" --arg ip "$ip" \
+          --arg public_host "$public_host" --argjson public_port "$public_port" \
+          --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
     '{
       type: $type, port: $port, uuid: $uuid,
       encryption: $enc, decryption: $dec,
-      ip: $ip, time: $time
+      ip: $ip, publicHost: $public_host, publicPort: $public_port, time: $time
     }' > "$NODE_INFO"
 
     # 分享链接
-    local disp=$ip; [[ "$ip" =~ ":" ]] && disp="[$ip]"
-    local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&type=tcp&security=none#VLESS-PQ-${port}"
+    local link="vless://${uuid}@${public_disp}:${public_port}?encryption=${enc}&type=tcp&security=none#VLESS-PQ-${public_port}"
     echo "$link" > "$XRAY_DIR/vless-link.txt"
 
     echo ""
     echo -e "${GREEN}════════════ VLESS + Encryption (PQ) ════════════${NC}"
-    echo -e "  地址:   ${CYAN}$ip${NC}          端口: ${CYAN}$port${NC}"
+    echo -e "  地址:   ${CYAN}$public_host${NC}          端口: ${CYAN}$public_port${NC}"
+    [[ "$public_host:$public_port" != "$ip:$port" ]] && echo -e "  本机监听: ${CYAN}$ip:$port${NC}  NAT映射: ${CYAN}$public_host:$public_port${NC}"
     echo -e "  UUID:   ${CYAN}$uuid${NC}"
     echo ""
     echo -e "${BOLD}分享链接 (可直接导入):${NC}"
@@ -417,7 +447,7 @@ config_encryption() {
 config_reality_encryption() {
     step "配置 REALITY + VLESS Encryption (双层)"
 
-    local port=${1:-443}
+    local port=${1:-$(random_port)}
     read -rp "$(ask "端口 (默认 $port): ")" i; port=${i:-$port}
     is_valid_port "$port" || error "无效端口"
 
@@ -454,6 +484,10 @@ config_reality_encryption() {
     esac
 
     local ip; ip=$(get_ip)
+    local ep; ep=$(prompt_public_endpoint "$port" "$ip")
+    local public_host; public_host=$(endpoint_host "$ep")
+    local public_port; public_port=$(endpoint_port "$ep")
+    local public_disp; public_disp=$(format_host "$public_host")
 
     # 追加 inbounds (兼容已有节点)
     local cfg new_inbound
@@ -492,22 +526,23 @@ config_reality_encryption() {
     jq -n --arg type "reality-enc" --argjson port "$port" --arg uuid "$uuid" \
           --arg sni "$sni" --arg pbk "$pbk" --arg pk "$pk" --arg sid "$sid" \
           --arg dest "$dest" --arg enc "$enc" --arg dec "$dec" \
-          --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+          --arg ip "$ip" --arg public_host "$public_host" --argjson public_port "$public_port" \
+          --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
     '{
       type: $type, port: $port, uuid: $uuid, sni: $sni,
       pbk: $pbk, pk: $pk, sid: $sid, dest: $dest,
       encryption: $enc, decryption: $dec,
-      ip: $ip, time: $time
+      ip: $ip, publicHost: $public_host, publicPort: $public_port, time: $time
     }' > "$NODE_INFO"
 
     # 分享链接 (REALITY + PQ)
-    local disp=$ip; [[ "$ip" =~ ":" ]] && disp="[$ip]"
-    local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&security=reality&sni=${sni}&pbk=${pbk}&sid=${sid}&fp=chrome&type=tcp&headerType=none#VLESS-PQ-REALITY-${port}"
+    local link="vless://${uuid}@${public_disp}:${public_port}?encryption=${enc}&security=reality&sni=${sni}&pbk=${pbk}&sid=${sid}&fp=chrome&type=tcp&headerType=none#VLESS-PQ-REALITY-${public_port}"
     echo "$link" > "$XRAY_DIR/vless-link.txt"
 
     echo ""
     echo -e "${GREEN}══════════ REALITY + Encryption (双层) ══════════${NC}"
-    echo -e "  地址:   ${CYAN}$ip${NC}          端口: ${CYAN}$port${NC}"
+    echo -e "  地址:   ${CYAN}$public_host${NC}          端口: ${CYAN}$public_port${NC}"
+    [[ "$public_host:$public_port" != "$ip:$port" ]] && echo -e "  本机监听: ${CYAN}$ip:$port${NC}  NAT映射: ${CYAN}$public_host:$public_port${NC}"
     echo -e "  UUID:   ${CYAN}$uuid${NC}"
     echo -e "  伪装:   ${CYAN}$sni${NC}    指纹: chrome"
     echo -e "  REALITY公钥: ${CYAN}$pbk${NC}"
@@ -528,6 +563,10 @@ config_basic() {
 
     local uuid; uuid=$("$XRAY_BIN" uuid 2>/dev/null)
     local ip; ip=$(get_ip)
+    local ep; ep=$(prompt_public_endpoint "$port" "$ip")
+    local public_host; public_host=$(endpoint_host "$ep")
+    local public_port; public_port=$(endpoint_port "$ep")
+    local public_disp; public_disp=$(format_host "$public_host")
 
     local cfg new_inbound
     if [[ -f "$XRAY_CONFIG" ]]; then cfg=$(cat "$XRAY_CONFIG")
@@ -544,13 +583,15 @@ config_basic() {
         'if .inbounds == null then .inbounds = [] else . end | .inbounds += [$new]' > "$XRAY_CONFIG"
 
     jq -n --arg type "basic" --argjson port "$port" --arg uuid "$uuid" \
-          --arg ip "$ip" --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
-    '{ type: $type, port: $port, uuid: $uuid, ip: $ip, time: $time }' > "$NODE_INFO"
+          --arg ip "$ip" --arg public_host "$public_host" --argjson public_port "$public_port" \
+          --arg time "$(date '+%Y-%m-%d %H:%M:%S')" \
+    '{ type: $type, port: $port, uuid: $uuid, ip: $ip, publicHost: $public_host, publicPort: $public_port, time: $time }' > "$NODE_INFO"
 
-    local link="vless://${uuid}@${ip}:${port}?encryption=none&type=tcp&security=none#VLESS-Basic-${port}"
+    local link="vless://${uuid}@${public_disp}:${public_port}?encryption=none&type=tcp&security=none#VLESS-Basic-${public_port}"
     echo "$link" > "$XRAY_DIR/vless-link.txt"
 
-    echo -e "${GREEN}VLESS 基础版已配置${NC}  端口: $port  UUID: $uuid"
+    echo -e "${GREEN}VLESS 基础版已配置${NC}  端口: $public_port  UUID: $uuid"
+    [[ "$public_host:$public_port" != "$ip:$port" ]] && echo -e "  本机监听: ${CYAN}$ip:$port${NC}  NAT映射: ${CYAN}$public_host:$public_port${NC}"
     echo -e "${GREEN}$link${NC}"
 }
 
@@ -596,12 +637,16 @@ view_config() {
     local info; info=$(load_node_json) || { warn "无节点信息"; return; }
     local type; type=$(echo "$info" | jq -r '.type//empty')
     local port; port=$(echo "$info" | jq -r '.port//empty')
+    local public_port; public_port=$(echo "$info" | jq -r '.publicPort//.port//empty')
     local uuid; uuid=$(echo "$info" | jq -r '.uuid//empty')
     local ip; ip=$(get_ip)
+    local public_host; public_host=$(echo "$info" | jq -r --arg ip "$ip" '.publicHost//$ip')
+    local public_disp; public_disp=$(format_host "$public_host")
 
     echo -e "\n${BOLD}═══ 节点配置 ═══${NC}"
-    echo -e "  类型: ${GREEN}$type${NC}    端口: ${CYAN}$port${NC}"
-    echo -e "  地址: ${CYAN}$ip${NC}    UUID: ${CYAN}$uuid${NC}"
+    echo -e "  类型: ${GREEN}$type${NC}    端口: ${CYAN}$public_port${NC}"
+    echo -e "  地址: ${CYAN}$public_host${NC}    UUID: ${CYAN}$uuid${NC}"
+    [[ "$public_host:$public_port" != "$ip:$port" ]] && echo -e "  本机监听: ${CYAN}$ip:$port${NC}  NAT映射: ${CYAN}$public_host:$public_port${NC}"
 
     if [[ "$type" == "reality" ]]; then
         local sni pbk sid
@@ -610,13 +655,12 @@ view_config() {
         sid=$(echo "$info" | jq -r '.sid//empty')
         echo -e "  SNI: ${CYAN}$sni${NC}    公钥: ${CYAN}$pbk${NC}"
         echo -e "  ShortId: ${CYAN}$sid${NC}"
-        local link="vless://${uuid}@${ip}:${port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=tcp&headerType=none#REALITY-${sni}"
+        local link="vless://${uuid}@${public_disp}:${public_port}?flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pbk}&sid=${sid}&spx=%2F&type=tcp&headerType=none#REALITY-${sni}"
         echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
         echo "$link" > "$XRAY_DIR/vless-link.txt"
     elif [[ "$type" == "encryption" ]]; then
         local enc; enc=$(echo "$info" | jq -r '.encryption//empty')
-        local disp=$ip; [[ "$ip" =~ ":" ]] && disp="[$ip]"
-        local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&type=tcp&security=none#VLESS-PQ-${port}"
+        local link="vless://${uuid}@${public_disp}:${public_port}?encryption=${enc}&type=tcp&security=none#VLESS-PQ-${public_port}"
         echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
         echo "$link" > "$XRAY_DIR/vless-link.txt"
     elif [[ "$type" == "reality-enc" ]]; then
@@ -627,12 +671,11 @@ view_config() {
         enc=$(echo "$info" | jq -r '.encryption//empty')
         echo -e "  SNI: ${CYAN}$sni${NC}    公钥: ${CYAN}$pbk${NC}"
         echo -e "  ShortId: ${CYAN}$sid${NC}    PQ: ${CYAN}$(echo "$enc" | wc -c) chars${NC}"
-        local disp=$ip; [[ "$ip" =~ ":" ]] && disp="[$ip]"
-        local link="vless://${uuid}@${disp}:${port}?encryption=${enc}&security=reality&sni=${sni}&pbk=${pbk}&sid=${sid}&fp=chrome&type=tcp&headerType=none#VLESS-PQ-REALITY-${port}"
+        local link="vless://${uuid}@${public_disp}:${public_port}?encryption=${enc}&security=reality&sni=${sni}&pbk=${pbk}&sid=${sid}&fp=chrome&type=tcp&headerType=none#VLESS-PQ-REALITY-${public_port}"
         echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
         echo "$link" > "$XRAY_DIR/vless-link.txt"
     elif [[ "$type" == "basic" ]]; then
-        local link="vless://${uuid}@${ip}:${port}?encryption=none&type=tcp&security=none#VLESS-Basic-${port}"
+        local link="vless://${uuid}@${public_disp}:${public_port}?encryption=none&type=tcp&security=none#VLESS-Basic-${public_port}"
         echo -e "\n${BOLD}分享链接:${NC}\n${GREEN}$link${NC}"
         echo "$link" > "$XRAY_DIR/vless-link.txt"
     fi
@@ -837,7 +880,7 @@ uninstall_xray() {
 }
 
 create_alias() {
-    local script_url="https://raw.githubusercontent.com/charmingyi/xray-vless-install/e3634cb/install.sh"
+    local script_url="https://raw.githubusercontent.com/charmingyi/xray-vless-install/main/install.sh"
     echo "#!/bin/bash" > /usr/local/bin/xr
     echo "bash <(curl -sL $script_url)" >> /usr/local/bin/xr
     chmod +x /usr/local/bin/xr
